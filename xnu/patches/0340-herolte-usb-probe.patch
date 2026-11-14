@@ -2018,10 +2018,10 @@ index 0a62201..d3299d3 100644
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_usb.c b/bsd/dev/herolte_usb.c
 new file mode 100644
-index 0000000..44d5198
+index 0000000..d3fda6b
 --- /dev/null
 +++ b/bsd/dev/herolte_usb.c
-@@ -0,0 +1,822 @@
+@@ -0,0 +1,824 @@
 +/*
 + * HEROLTE: USB device mode (step 2), ported from bsd/dev/sweet_usb.c.
 + *
@@ -2035,6 +2035,8 @@ index 0000000..44d5198
 + * Step 1 of docs/herolte-usb-plan.md (the probe) lives in herolte_ufs.c.
 + *   herousb=3  start the device controller and the live log
 + */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
