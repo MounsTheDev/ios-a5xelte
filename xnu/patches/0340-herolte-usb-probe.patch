@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
-index 0a62201..670c5df 100644
+index 0a62201..2fdef79 100644
 --- a/bsd/dev/herolte_ufs.c
 +++ b/bsd/dev/herolte_ufs.c
 @@ -765,6 +765,8 @@ herolte_log_start(void)
@@ -20,7 +20,7 @@ index 0a62201..670c5df 100644
  	return 0;
  }
  
-@@ -948,4 +952,98 @@ herolte_ufs_rootdev(dev_t *dev)
+@@ -948,4 +952,100 @@ herolte_ufs_rootdev(dev_t *dev)
  	*dev = su.bdev;
  	return 0;
  }
@@ -33,8 +33,10 @@ index 0a62201..670c5df 100644
 + * reads the gate status first and only goes near the DWC3 when herousb=2.
 + *
 + *   herousb=0  off
-+ *   herousb=1  CMU FSYS0 gate status only (default)
-+ *   herousb=2  also read DWC3 + PHY
++ *   herousb=1  CMU FSYS0 gate status only
++ *   herousb=2  also read DWC3 + PHY (default for this test: CG_VAL reads 1
++ *              on all four gates and the muxes are programmed, so the
++ *              clocks are expected to be running)
 + *
 + * Register offsets verified against the Exynos 8890 sources
 + * (S5E8890-sfrbase.h:15, S5E8890-cmusfr.h:758-763, 782, 790), not guessed.
@@ -65,7 +67,7 @@ index 0a62201..670c5df 100644
 +static void
 +herolte_usb_probe(void)
 +{
-+	int level = 1;
++	int level = 2;
 +	vm_offset_t cmu, dwc, phy;
 +
 +	PE_parse_boot_argn("herousb", &level, sizeof(level));
