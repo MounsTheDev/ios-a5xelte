@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 961f7e3..5dccbc4 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -358,7 +358,7 @@ static uint32_t hg_affinity = 1;
+  * 0: before and after every job, as Linux's panfrost. 1 (default): only after, as a job begun finds it clean already.
+  * 2: and not after vertex jobs either, whose results the fragment job reads through the same cache.
+  */
+-static uint32_t hg_flush_mode = 1;
++static uint32_t hg_flush_mode = 2;
+ /* GPU VA of the job chain hg_run() starts, and of its header (for the log). */
+ static uint64_t hg_job_va = HG_TEST_VA;
+ static vm_offset_t hg_job_cpu;
