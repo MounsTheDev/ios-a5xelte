@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/herolte_drop_core.h b/bsd/dev/herolte_drop_core.h
+index f3aa0c9..cccb89b 100644
+--- a/bsd/dev/herolte_drop_core.h
++++ b/bsd/dev/herolte_drop_core.h
+@@ -14,7 +14,7 @@
+ #include <stddef.h>
+ 
+ #define HDC_BLOCK        4096u
+-#define HDC_ZONE_BLOCKS  32768u                                 /* 128 MiB */
++#define HDC_ZONE_BLOCKS  131072u                                /* 512 MiB */
+ #define HDC_MAX_PAYLOAD  ((uint64_t)(HDC_ZONE_BLOCKS - 1) * HDC_BLOCK)
+ #define HDC_CHUNK        (256u * HDC_BLOCK)                     /* ventana de lectura: 1 MiB */
+ #define HDC_LIST_MAX     65536u                                 /* tamaño de stage.list */
