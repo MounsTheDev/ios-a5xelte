@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index 1da85fa..2d0c2ad 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -701,6 +701,8 @@ herolte_log_start(void)
+ 	}
+ }
+ 
++static void herolte_usb_probe(void);
++
+ static int
+ herolte_ufs_init(void)
+ {
+@@ -776,6 +778,8 @@ herolte_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	herolte_log_start();
++	/* USB state probe (herousb): read-only, CMU FSYS0 only unless herousb=2. */
++	herolte_usb_probe();
+ 	return 0;
+ }
+ 
+@@ -884,4 +888,87 @@ herolte_ufs_rootdev(dev_t *dev)
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++
++/*
++ * USB state probe (step 1 of docs/herolte-usb-plan.md), read only.
++ *
++ * The DWC3 at 0x15400000 sits behind clocks gated by CMU FSYS0; touching a
++ * gated block hangs the CPU. CMU FSYS0 itself is always clocked, so this
++ * reads the gate status first and only goes near the DWC3 when herousb=2.
++ *
++ *   herousb=0  off
++ *   herousb=1  CMU FSYS0 gate status only (default)
++ *   herousb=2  also read DWC3 + PHY
++ *
++ * Register offsets verified against the Exynos 8890 sources
++ * (S5E8890-sfrbase.h:15, S5E8890-cmusfr.h:758-763, 782, 790), not guessed.
++ * The bit convention of the status registers is NOT documented there: the
++ * raw values are printed so two boots (cable in / out) can be compared.
++ */
++#define HEROLTE_CMU_FSYS0_PA    0x10E90000
++#define HEROLTE_CMU_FSYS0_SIZE  0x00010000
++#define HEROLTE_CG_STAT_SUSPEND 0x1C40
++#define HEROLTE_CG_STAT_REF     0x1C4C
++#define HEROLTE_CG_STAT_PHYCLK  0x1C50
++#define HEROLTE_CG_STAT_PIPE    0x1C54
++#define HEROLTE_QCH_USBDRD30    0x201C
++#define HEROLTE_QCH_PHYCTRL     0x2040
++#define HEROLTE_DWC3_PA         0x15400000
++#define HEROLTE_DWC3_SIZE       0x00010000
++#define HEROLTE_PHY_PA          0x15500000
++#define HEROLTE_PHY_SIZE        0x00000100
++
++static uint32_t
++herolte_usb_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++herolte_usb_probe(void)
++{
++	int level = 1;
++	vm_offset_t cmu, dwc, phy;
++
++	PE_parse_boot_argn("herousb", &level, sizeof(level));
++	if (level <= 0) {
++		return;
++	}
++	cmu = ml_io_map(HEROLTE_CMU_FSYS0_PA, HEROLTE_CMU_FSYS0_SIZE);
++	if (cmu == 0) {
++		printf("HEROLTE USB: CMU FSYS0 map failed\n");
++		return;
++	}
++	printf("HEROLTE USB: CMU stat suspend 0x%08x ref 0x%08x phyclk 0x%08x pipe 0x%08x\n",
++	    herolte_usb_rd(cmu, HEROLTE_CG_STAT_SUSPEND),
++	    herolte_usb_rd(cmu, HEROLTE_CG_STAT_REF),
++	    herolte_usb_rd(cmu, HEROLTE_CG_STAT_PHYCLK),
++	    herolte_usb_rd(cmu, HEROLTE_CG_STAT_PIPE));
++	printf("HEROLTE USB: QCH usbdrd30 0x%08x phyctrl 0x%08x\n",
++	    herolte_usb_rd(cmu, HEROLTE_QCH_USBDRD30),
++	    herolte_usb_rd(cmu, HEROLTE_QCH_PHYCTRL));
++	if (level < 2) {
++		return;
++	}
++	dwc = ml_io_map(HEROLTE_DWC3_PA, HEROLTE_DWC3_SIZE);
++	if (dwc == 0) {
++		printf("HEROLTE USB: DWC3 map failed\n");
++		return;
++	}
++	printf("HEROLTE USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    herolte_usb_rd(dwc, 0xc120), herolte_usb_rd(dwc, 0xc110),
++	    herolte_usb_rd(dwc, 0xc118), herolte_usb_rd(dwc, 0xc200));
++	printf("HEROLTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
++	    herolte_usb_rd(dwc, 0xc700), herolte_usb_rd(dwc, 0xc704),
++	    herolte_usb_rd(dwc, 0xc70c), herolte_usb_rd(dwc, 0xc720));
++	phy = ml_io_map(HEROLTE_PHY_PA, HEROLTE_PHY_SIZE);
++	if (phy != 0) {
++		printf("HEROLTE USB: PHY 0x%08x 0x%08x 0x%08x 0x%08x\n",
++		    herolte_usb_rd(phy, 0x00), herolte_usb_rd(phy, 0x04),
++		    herolte_usb_rd(phy, 0x08), herolte_usb_rd(phy, 0x0c));
++	}
++}
++
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */
