@@ -2018,10 +2018,10 @@ index 0a62201..d3299d3 100644
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_usb.c b/bsd/dev/herolte_usb.c
 new file mode 100644
-index 0000000..59633c5
+index 0000000..863a39f
 --- /dev/null
 +++ b/bsd/dev/herolte_usb.c
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,873 @@
 +/*
 + * HEROLTE: USB device mode (step 2), ported from bsd/dev/sweet_usb.c.
 + *
@@ -2808,7 +2808,31 @@ index 0000000..59633c5
 +	ud.dma_pa = ptoa_64(pn);
 +	ud_if_create();
 +
-+	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/*
++	 * Wake the PHY before touching the controller. S-Boot leaves it forced
++	 * asleep: PHYUTMI (0x15500008) reads 0x00001073, i.e. FORCESLEEP (bit 0)
++	 * and FORCESUSPEND (bit 1) set, so the pipe clock is off and every
++	 * endpoint command sits on CMDACT until the timeout. There is no MUIC
++	 * driver to report VBUS either, so the session is forced here: this is
++	 * the Exynos equivalent of the QSCRATCH override the donor needed.
++	 */
++	vm_offset_t phy = ml_io_map(HEROLTE_PHY_PA, HEROLTE_PHY_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB: PHY map failed\n");
++		return;
++	}
++	uint32_t utmi = usb_rd(phy, 0x08);
++	utmi &= ~((1u << 1) | (1u << 0));        /* FORCESUSPEND, FORCESLEEP */
++	utmi |= (1u << 9) | (1u << 10);          /* VBUSVLDEXT, VBUSVLDEXTSEL */
++	*(volatile uint32_t *)(phy + 0x08) = utmi;
++	uint32_t linksys = usb_rd(phy, 0x04);
++	linksys |= (1u << 8);                    /* LINKSYSTEM_FORCE_VBUSVALID */
++	*(volatile uint32_t *)(phy + 0x04) = linksys;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET USB: PHY woken, PHYUTMI 0x%08x LINKSYSTEM 0x%08x\n",
++	    usb_rd(phy, 0x08), usb_rd(phy, 0x04));
++
++	/* Device controller soft reset (global setup stays as S-Boot left it). */
 +	dwc_wr(DCTL, DCTL_CSFTRST);
 +	int i;
 +	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
