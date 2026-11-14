@@ -2018,10 +2018,10 @@ index 0a62201..d3299d3 100644
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_usb.c b/bsd/dev/herolte_usb.c
 new file mode 100644
-index 0000000..1e55aff
+index 0000000..4d42f16
 --- /dev/null
 +++ b/bsd/dev/herolte_usb.c
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,894 @@
 +/*
 + * HEROLTE: USB device mode (step 2), ported from bsd/dev/sweet_usb.c.
 + *
@@ -2078,6 +2078,7 @@ index 0000000..1e55aff
 + * ep0.c).
 + */
 +#define GCTL            0xc110
++#define GUSB2PHYCFG     0xc200
 +#define GEVNTADRLO      0xc400
 +#define GEVNTADRHI      0xc404
 +#define GEVNTSIZ        0xc408
@@ -2831,6 +2832,26 @@ index 0000000..1e55aff
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	printf("SWEET USB: PHY woken, PHYUTMI 0x%08x LINKSYSTEM 0x%08x\n",
 +	    usb_rd(phy, 0x08), usb_rd(phy, 0x04));
++
++	/*
++	 * Full core soft reset, as Linux dwc3_core_soft_reset(): PHY soft reset
++	 * (GUSB2PHYCFG bit 31) followed by GCTL.CORESOFTRESET (bit 11). The
++	 * device-only reset below (DCTL.CSFTRST) was not enough here: the
++	 * command FIFO stayed unusable and SETEPCONFIG never retired, while
++	 * DEPSTARTCFG -- which resets the queue rather than using it -- passed.
++	 */
++	uint32_t g2 = dwc_rd(GUSB2PHYCFG);
++	dwc_wr(GUSB2PHYCFG, g2 | (1u << 31));
++	delay(1000);
++	dwc_wr(GUSB2PHYCFG, g2 & ~(1u << 31));
++	delay(1000);
++	uint32_t gctl0 = dwc_rd(GCTL);
++	dwc_wr(GCTL, gctl0 | (1u << 11));
++	delay(1000);
++	dwc_wr(GCTL, gctl0 & ~(1u << 11));
++	delay(1000);
++	printf("SWEET USB: core soft reset, GCTL 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG));
 +
 +	/* Device controller soft reset (global setup stays as S-Boot left it). */
 +	dwc_wr(DCTL, DCTL_CSFTRST);
