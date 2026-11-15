@@ -778,5 +778,46 @@ GPU 338/650) + pwr2 (plafonds batterie, anti-UVLO, jauge lissée), image
 
 ---
 
+## 21. Chargeur temps réel et Bluetooth BCM4359 (bt1, patches `0353`/`0354`)
+
+### Mission 0 — le débranchement
+
+- `herolte_fg_read` lit le chargeur **avant** la jauge : `CHG_INT` `0xB0`
+  (read-clear), `CHG_INT_OK` `0xB2` bit 6 `CHGIN_OK`, `CHG_DETAILS_00`
+  `0xB3` bits 6:5 `CHGIN_DTLS`. Les deux doivent être vrais ; tout échec
+  repasse en batterie. Aucun latch ne survit au débranchement.
+- `SweetBattery` et `hg_power_thread` utilisent cet état live ; log
+  `HEROLTE PWR: plug=0|1 vbat=…mV ac_raw=… dtls=… cap_cpu=… cap_gpu=…`.
+
+### Bluetooth, Phase 1 (matériel)
+
+- **UART1 `0x14C20000`**, pas `0x13630000` : le nœud `uart@14C20000` est
+  `okay` avec `pinctrl-names = "btdefault"/"btsleep"` ; `uart@13630000`
+  est `disabled`. Broches **GPE0-0..3**, fonction 2, PUD 3, DRV 3.
+- **BT_REG_ON** = **GPJ1-7**, PERIC1 `0x14CC0000` + `0x60`.
+- **BT_WAKE** = **GPI2-3**, FSYS0 `0x10E60000` + `0x20`.
+- **BT_HOST_WAKE** = **GPA2-3**, ALIVE `0x10580000` + `0x40`, entrée.
+- Firmware **`bcm4359C0_semco.hcd`** (59 702 octets, sha256
+  `97d839cb1a31bb2de8736817bb7fc7e9c4c944938000960bf2c710d3839df332`)
+  depuis VENDOR, dans `drop/bt/bcm4359.hcd` → drop zone
+  `/private/var/herolte/bt/bcm4359.hcd`.
+- Driver `bsd/dev/herolte_bt.c` : 8N1 115200 RTS/CTS, HCI H4
+  (`01 03 0C 00`, `01 2E FC 00`, `.hcd`, reset), BD_ADDR, version locale,
+  puis polling RX 5/20 ms.
+
+### Drop
+
+- `drop/` est **gitignoré** : le firmware reste local, comme celui du
+  Wi-Fi.
+- `python3 tools/herolte-drop.py adb --generation 17 …`
+  `bt/bcm4359.hcd=drop/bt/bcm4359.hcd` ; **deux redémarrages** après la
+  drop.
+
+### Image bt1
+
+À compléter après le build.
+
+---
+
 *Fin du document. Il est délibérément exhaustif : son but est qu'aucune des
 vingt heures de mesure de cette session ne soit à refaire.*
