@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..594e56e 100644
+index f08a35c..6751e3c 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -58,7 +58,7 @@ index f08a35c..594e56e 100644
  static bool
  fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  {
-@@ -216,27 +251,215 @@ herolte_fg_init(void)
+@@ -216,27 +251,254 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -74,6 +74,23 @@ index f08a35c..594e56e 100644
 + * Returns 0 when both reads answered, -1 otherwise; either way the published
 + * state is the one just read, and a failed read means "no cable".
 + */
++/*
++ * (0365) The gauge's Current register (0x0A) as a signed value.  The gauge is
++ * the one block on this chip that has always answered, and its current is a
++ * direct physical statement: positive means charge into the battery.
++ */
++static bool
++fg_charger_current(int16_t *value)
++{
++	uint16_t raw = 0;
++
++	if (!fg_word_at(0x36, 0x0A, &raw)) {
++		return false;
++	}
++	*value = (int16_t)raw;
++	return true;
++}
++
  int
 -herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
 +herolte_fg_charger(void)
@@ -98,117 +115,132 @@ index f08a35c..594e56e 100644
 +	if (!fg_i2c) {
 +		return -1;
 +	}
-+	uint8_t chg = 0, dtls = 0;
-+	bool chg_ok = fg_byte_at(0x66, 0xB2, &chg);
-+	bool dtls_ok = fg_byte_at(0x66, 0xB3, &dtls);
-+	herolte_fg_ac_valid = chg_ok;
++	/*
++	 * (0365) The MAX77854 is one chip with three I2C sub-addresses, and bt6
++	 * proved which one holds what.  Reading 0x66 with a single byte now gives
++	 * 0x00 = 0x54 (the chip ID) and 0x01 = 0x02, so the width was wrong
++	 * before; but 0xB0..0xB7 at 0x66 stay 0xff, because those registers are
++	 * not in the Top block at all.  Samsung's mfd driver instantiates its
++	 * blocks as i2c_new_dummy() clients on the same HSI2C1:
++	 *
++	 *   0x66  Top / PMIC      (ID 0x54; also the address TWRP binds)
++	 *   0x69  Charger         CHG_INT_OK 0xB2, CHG_DETAILS_00 0xB3
++	 *   0x25  MUIC            STATUS1 0x01 (chgtyp 2:0), STATUS2 0x02 (vbvolt bit 1)
++	 *
++	 * and that also explains why 1-0069 showed "dummy" under TWRP: dummy is
++	 * what i2c_new_dummy() registers, not an absent device.
++	 *
++	 * The gauge at 0x36 is the arbiter, because it measures current directly:
++	 * a sustained positive Current means energy is entering the battery.
++	 */
++	uint8_t chg = 0, dtls = 0, st1 = 0, st2 = 0;
++	bool chg_ok = fg_byte_at(0x69, 0xB2, &chg);
++	bool dtls_ok = fg_byte_at(0x69, 0xB3, &dtls);
++	bool st1_ok = fg_byte_at(0x25, 0x01, &st1);
++	bool st2_ok = fg_byte_at(0x25, 0x02, &st2);
++	int16_t cur = 0;
++	bool cur_ok = fg_charger_current(&cur);
++
 +	herolte_fg_ac_raw = chg;
 +	herolte_fg_dtls = dtls;
++	bool chgin = chg_ok && chg != 0xff && (chg & 0x40);
++	bool vbvolt = st2_ok && st2 != 0xff && (st2 & 0x02);
++	bool charging_now = cur_ok && cur >= 150;
++
 +	/*
-+	 * (0358) 0xFF is not a charger state, it is a bus that answered nothing:
-+	 * an unanswered read leaves SDA released, so the FIFO yields all ones and
-+	 * bit 6 (CHGIN_OK) comes back set no matter what the cable is doing.  bt2
-+	 * published exactly that, "ac_raw=0xff dtls=0xff" with the cable out, and
-+	 * the lightning bolt stayed because bit 6 of 0xff reads as "on".  A
-+	 * register of the MFD that reads all ones is treated as "no answer", and
-+	 * a failed read was already "no cable".  Only 0x40 and 0x60 in their bytes
-+	 * ever mean a cable, and those single bits are what the chip drives.
++	 * The cable is present if the Charger block says CHGIN_OK, or the MUIC
++	 * says VBUS is up, or the gauge sees current flowing in.  Two of those
++	 * three disagreeing is still a cable, because each block powers up at a
++	 * different moment; only all three silent means no cable.
 +	 */
-+	bool chg_dead = !chg_ok || chg == 0xff;
-+	bool dtls_dead = !dtls_ok || dtls == 0xff;
-+	if (chg_dead) {
-+		/*
-+		 * (0364) The MFD half is unreadable.  Reach the cable through the
-+		 * two halves that do answer on this board: the MUIC's VBUS flag and
-+		 * the gauge's current.  TWRP, with Android's charger driver bound,
-+		 * reads online=3 / current_now=1000 on the same chip, so the
-+		 * hardware can report this; only our route to 0x66 is broken.
-+		 *
-+		 * Neither half is trusted alone: 0xB7 is the MUIC's VBUS bit in
-+		 * Samsung's max77854 layout, and a positive current is what a
-+		 * charging battery shows.  VBUS alone keeps the bolt honest while
-+		 * the current decides charging, and both stay logged raw above.
-+		 */
-+		uint8_t muic = 0;
-+		bool muic_ok = fg_byte_at(0x66, 0xB7, &muic);
-+		bool vbus = muic_ok && (muic & 0x40) && muic != 0xff;
-+		if (!muic_ok || muic == 0xff) {
-+			herolte_fg_ac_valid = 0;
-+			herolte_fg_ac = 0;
-+			return -1;
-+		}
++	if (chgin || vbvolt || charging_now) {
 +		herolte_fg_ac_valid = 1;
-+		herolte_fg_ac = vbus ? 1 : 0;
++		herolte_fg_ac = 1;
 +		return 0;
- 	}
-+	herolte_fg_ac = (chg & 0x40) && !dtls_dead && ((dtls & 0x60) != 0);
-+	return (dtls_dead && (chg & 0x40)) ? -1 : 0;
++	}
++	if (chg_ok || st2_ok || cur_ok) {
++		/* The blocks answered and none of them sees power: a real "out". */
++		herolte_fg_ac_valid = 1;
++		herolte_fg_ac = 0;
++		return 0;
++	}
++	return -1;
 +}
 +
 +/*
-+ * (0360) Which charger register actually answers on this board.
-+ *
-+ * The TWRP devicetree has one node, max77854@66, and a running Android
-+ * exposes exactly one bound driver, 1-0066 max77854, whose power_supply
-+ * reports online=3, present=1, current_now=1000, status=Charging with the
-+ * cable in.  So 0x66 is the right address and 0xB2/0xB3 are the wrong
-+ * registers: both come back 0xff whether the cable is in or out.  1-0069
-+ * exists but is bound to the dummy driver, so the charger block is not
-+ * there either.  This dump prints the whole status window once, so a single
-+ * journal says which offset carries CHGIN.
++ * (0365) The same current in mA, 0.25 mA per LSB, for the log.
++ */
++int
++herolte_fg_current_mA(void)
++{
++	int16_t raw = 0;
++
++	if (!fg_charger_current(&raw)) {
++		return 0;
+ 	}
++	/* 0.25 mA per LSB, the MAX77854 fuel gauge's step. */
++	return (int)((int32_t)raw / 4);
++}
++
++/*
++ * (0365) The whole picture in one block: the three sub-addresses of the same
++ * chip side by side, plus the gauge's current.  One plug/unplug pair of dumps
++ * therefore shows which block moves, instead of one hypothesis per build.
 + */
 +void
 +herolte_fg_dump_charger(const char *why)
 +{
-+	static const char *names[8] = {
-+		"int", "int2", "ok", "dtls", "B4", "B5", "B6", "B7"
-+	};
++	uint16_t cur_raw = 0;
 +
-+	if (!fg_i2c) {
-+		printf("HEROLTE FG: dump %s: no i2c\n", why);
-+		return;
++	if (fg_word_at(0x36, 0x0A, &cur_raw)) {
++		printf("HEROLTE FG: 0x36 current raw=%#x (%d mA) vcell=%#x\n",
++		    (unsigned)cur_raw, herolte_fg_current_mA(), 0);
 +	}
 +	printf("HEROLTE FG: ---- dump (%s) ----\n", why);
 +	for (unsigned i = 0; i < 8; i++) {
-+		uint8_t v = 0;
-+		bool ok = fg_byte_at(0x66, (uint8_t)(0xB0 + i), &v);
-+		printf("HEROLTE FG: 0x66:0x%02x %-5s = %#02x (%s)\n",
-+		    0xB0 + i, names[i], (unsigned)v, ok ? "answered" : "no answer");
++		uint8_t top = 0, chg = 0, muic = 0;
++		bool t_ok = fg_byte_at(0x66, (uint8_t)(0xB0 + i), &top);
++		bool c_ok = fg_byte_at(0x69, (uint8_t)(0xB0 + i), &chg);
++		bool m_ok = fg_byte_at(0x25, (uint8_t)(0xB0 + i), &muic);
++		printf("HEROLTE FG: 0x%02x top=%#02x%s chg=%#02x%s muic=%#02x%s\n",
++		    0xB0 + i, top, t_ok ? "" : "?", chg, c_ok ? "" : "?",
++		    muic, m_ok ? "" : "?");
 +	}
-+	/*
-+	 * The low window as well: an MUIC or a charger detail register that
-+	 * flips with the cable can live below 0xB0, and this costs one boot.
-+	 */
-+	for (unsigned i = 0; i < 0x20; i++) {
++	/* The MUIC's own status bytes, where Samsung keeps vbvolt and chgtyp. */
++	for (unsigned i = 0; i < 4; i++) {
 +		uint8_t v = 0;
-+		bool ok = fg_byte_at(0x66, (uint8_t)i, &v);
-+		printf("HEROLTE FG: 0x66:0x%02x = %#02x (%s)\n", i, (unsigned)v,
-+		    ok ? "answered" : "no answer");
-+	}
-+	/* The gauge half of the same chip, which is known to answer. */
-+	for (unsigned i = 0; i < 3; i++) {
-+		static const uint8_t greg[3] = { 0x00, 0x0A, 0x0B };
-+		uint16_t v = 0;
-+		bool ok = fg_word_at(0x36, greg[i], &v);
-+		printf("HEROLTE FG: 0x36:0x%02x = %#04x (%s)\n", greg[i],
-+		    (unsigned)v, ok ? "answered" : "no answer");
++		bool ok = fg_byte_at(0x25, (uint8_t)(0x01 + i), &v);
++		printf("HEROLTE FG: 0x25:0x%02x = %#02x (%s)%s\n", 0x01 + i,
++		    (unsigned)v, ok ? "answered" : "no answer",
++		    (0x02 == 0x01 + i && (v & 0x02)) ? " vbvolt" : "");
 +	}
 +	printf("HEROLTE FG: ---- dump end ----\n");
 +}
 +
 +/*
-+ * (0361) A digest of the raw charger window, so the power thread can dump on
-+ * any byte changing rather than on the derived plug state.  bt4 conditioned
-+ * the dump on an edge in "ac", and ac could never change while 0xB2 read
-+ * 0xff, so the dump never ran and told us nothing.
++ * (0361) A digest of the raw bytes, so the power thread dumps on any change
++ * rather than on the derived plug state.  bt4 gated the dump on an edge in
++ * "ac" that could never arrive, and the journal said nothing at all.
 + */
++unsigned
++herolte_fg_charger_digest(void)
++{
++	uint8_t a = 0, b = 0, c = 0, d = 0;
++
++	if (!fg_i2c) {
++		return 0;
++	}
++	(void)fg_byte_at(0x69, 0xB2, &a);
++	(void)fg_byte_at(0x69, 0xB3, &b);
++	(void)fg_byte_at(0x25, 0x02, &c);
++	(void)fg_byte_at(0x25, 0x01, &d);
++	return ((unsigned)a << 24) | ((unsigned)b << 16) | ((unsigned)c << 8) | d;
++}
++
 +/*
-+ * (0362) The PMIC on the other HSI2C bus.  s2mps16 is at 0x66 on
++ * (0362) The PMIC on the other HSI2C controller.  s2mps16 is at 0x66 on
 + * hsi2c@10550000, while the charger sits at 0x66 on hsi2c@13650000: two
-+ * different buses, the same device address.  The Bluetooth side needs to
-+ * read and, if necessary, set LDO28 (VREG_BT) and the 32 kHz enable, and this
-+ * driver already owns a working HSI2C engine, so the two byte-sized helpers
-+ * live here instead of a second copy of the protocol in herolte_bt.c.
++ * different controllers, the same device address.
 + */
 +static vm_offset_t pmic_i2c;
 +
@@ -226,7 +258,7 @@ index f08a35c..594e56e 100644
 +		pmic_i2c = 0;
 +		return -1;
 +	}
-+	/* ETC0-0 and ETC0-1 as function 2 (HSI2C), no pull: the DTB's hs-i2c15-bus. */
++	/* ETC0-0 and ETC0-1 as function 2 (HSI2C), no pull: hs-i2c15-bus. */
 +	fg_wr(pins, 0x00, (fg_rd(pins, 0x00) & ~0xffu) | 0x22u);
 +	fg_wr(pins, 0x08, (fg_rd(pins, 0x08) & ~0xfu) | 0x0u);
 +	fg_wr(pmic_i2c, HSI2C_CTL, 0x80000009u);
@@ -238,10 +270,31 @@ index f08a35c..594e56e 100644
 +	return 0;
 +}
 +
++/* (0366) What that controller actually looks like, for the ldo28=0xff case. */
++void
++herolte_pmic_dump(void)
++{
++	if (!pmic_i2c) {
++		printf("HEROLTE PMIC: not mapped\n");
++		return;
++	}
++	printf("HEROLTE PMIC: ctl=%#x conf=%#x fs1=%#x fs2=%#x inten=%#x intstat=%#x\n",
++	    fg_rd(pmic_i2c, HSI2C_CTL), fg_rd(pmic_i2c, HSI2C_CONF),
++	    fg_rd(pmic_i2c, HSI2C_FS1), fg_rd(pmic_i2c, HSI2C_FS2),
++	    fg_rd(pmic_i2c, HSI2C_INT_EN), fg_rd(pmic_i2c, HSI2C_INT_STAT));
++	{
++		vm_offset_t pins = ml_io_map(PMIC_PINS_PA, 0x1000);
++		if (pins) {
++			printf("HEROLTE PMIC: etc0 con=%#x dat=%#x pud=%#x\n",
++			    fg_rd(pins, 0x00), fg_rd(pins, 0x04), fg_rd(pins, 0x08));
++		}
++	}
++}
++
 +int
 +herolte_pmic_rd(uint8_t reg, uint8_t *value)
 +{
-+	uint8_t b[2];
++	uint8_t b[1];
 +
 +	if (!pmic_i2c) {
 +		return -1;
@@ -265,20 +318,6 @@ index f08a35c..594e56e 100644
 +	b[0] = reg;
 +	b[1] = value;
 +	return fg_message_at(PMIC_ADDR, false, b, 2, true) ? 0 : -1;
-+}
-+
-+unsigned
-+herolte_fg_charger_digest(void)
-+{
-+	uint8_t b0 = 0, b2 = 0, b3 = 0;
-+
-+	if (!fg_i2c) {
-+		return 0;
-+	}
-+	(void)fg_byte_at(0x66, 0xB0, &b0);
-+	(void)fg_byte_at(0x66, 0xB2, &b2);
-+	(void)fg_byte_at(0x66, 0xB3, &b3);
-+	return ((unsigned)b0 << 16) | ((unsigned)b2 << 8) | (unsigned)b3;
 +}
 +
 +int

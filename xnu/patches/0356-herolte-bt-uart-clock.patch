@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..dd1da01 100644
+index 26fefa3..16a2050 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
-@@ -61,6 +61,39 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
+@@ -61,6 +61,41 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
  static bool bt_started;
  static int bt_sleep;
  
@@ -31,6 +31,8 @@ index 26fefa3..dd1da01 100644
 +extern int herolte_pmic_setup(void);
 +extern int herolte_pmic_rd(uint8_t reg, uint8_t *value);
 +extern int herolte_pmic_wr(uint8_t reg, uint8_t value);
++/* (0366) The controller's own registers, for the "ldo28=0xff" case. */
++extern void herolte_pmic_dump(void);
 +
 +/* s2mps16 regulator control: LDO28 is VREG_BT, always-on and boot-on in the DTB. */
 +#define PMIC_LDO28_CTRL 0x64
@@ -42,7 +44,7 @@ index 26fefa3..dd1da01 100644
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +146,158 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +148,165 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -94,8 +96,10 @@ index 26fefa3..dd1da01 100644
 +
 +	if (herolte_pmic_setup() != 0) {
 +		BT_LOG("HEROLTE BT: pmic unavailable, rails unread");
++		herolte_pmic_dump();
 +		return;
 +	}
++	herolte_pmic_dump();
 +	ldo_ok = herolte_pmic_rd(PMIC_LDO28_CTRL, &ldo);
 +	clk_ok = herolte_pmic_rd(PMIC_32K_CTRL, &clk);
 +	BT_LOG("HEROLTE BT: pmic ldo28=%#x%s 32k=%#x%s (before%s)",
@@ -176,7 +180,12 @@ index 26fefa3..dd1da01 100644
 +	bt_wr(bt_uart, UART_ULCON, 0x3);                        /* 8N1, one stop, no parity */
 +	bt_wr(bt_uart, UART_UFCON, 0x7);                        /* reset both FIFOs */
 +	bt_wr(bt_uart, UART_UFCON, 0x111);                      /* FIFO, 4/4 trigger */
-+	bt_wr(bt_uart, UART_UMCON, 0x1);                        /* AFC/RTS */
++	/*
++	 * (0367) AFC on, and RTS driven active: bit 4 enables auto flow control,
++	 * bit 0 makes RTS say "ready to receive" on the pad, which is what the
++	 * BCM4359 wants before it will transmit.
++	 */
++	bt_wr(bt_uart, UART_UMCON, 0x11);
 +	/*
 +	 * Clock select on the PCLK, transmitter and receiver running, and the
 +	 * receive-timeout bits the bootloader already had.  They are polled, but the
@@ -201,7 +210,7 @@ index 26fefa3..dd1da01 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +434,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +443,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -209,7 +218,7 @@ index 26fefa3..dd1da01 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,38 +450,53 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,39 +459,65 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
@@ -283,14 +292,27 @@ index 26fefa3..dd1da01 100644
 -	}
 -	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
 -	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
-+	/* The chip's own boot time, before HOST_WAKE is expected. */
-+	bt_msleep(150);
-+	int woke = bt_wait_host_wake(1500);
-+	BT_LOG("HEROLTE BT: uart=0x%x reg_on=%d wake=%d host_wake=%d waited=%d ms",
-+	    BT_UART_PA, (int)((bt_rd(bt_peric1, 0x64) >> 7) & 1u),
-+	    (int)((bt_rd(bt_fsys0, 0x24) >> 3) & 1u), bt_host_wake(), woke);
-+	/* (0356) 8N1 115200 from a known clock. */
+-	bt_msleep(10);
++	/*
++	 * (0367) The UART is configured BEFORE the chip is asked anything, and
++	 * HOST_WAKE is no longer a gate on sending.
++	 *
++	 * bt3 to bt6 configured the line after a 1500 ms wait on HOST_WAKE, and
++	 * the journal showed umcon=0 during that whole wait: the line had no
++	 * auto flow control and no RTS, so the BCM4359's CTS input never saw the
++	 * Exynos ready to receive.  A ROM that only raises HOST_WAKE once it has
++	 * something to report then had no reason to speak at all, and the code
++	 * spent 1500 ms waiting for a line that its own silence kept low.  The
++	 * sequence Samsung's driver uses is to open the port first, then power
++	 * the chip, then talk: AFC and RTS asserted, 8N1 and the divisor set,
++	 * 300 ms for the ROM, then HCI_Reset with no condition on HOST_WAKE.
++	 */
 +	bt_uart_conf();
- 	bt_msleep(10);
++	bt_msleep(300);
++	BT_LOG("HEROLTE BT: uart=0x%x reg_on=%d wake=%d host_wake=%d umcon=%#x ufstat=%#x",
++	    BT_UART_PA, (int)((bt_rd(bt_peric1, 0x64) >> 7) & 1u),
++	    (int)((bt_rd(bt_fsys0, 0x24) >> 3) & 1u), bt_host_wake(),
++	    bt_rd(bt_uart, UART_UMCON), bt_rd(bt_uart, UART_UFSTAT));
  	/* HCI_Reset, minidriver, .hcd, reset again. */
  	rlen = sizeof(reply);
+ 	bool reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
