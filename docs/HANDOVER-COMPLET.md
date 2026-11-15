@@ -694,5 +694,64 @@ le réveil instantané.
 
 ---
 
+## 19. Batterie, coupures et profils (pwr2, patch `0351`)
+
+### Paliers et tensions relevés
+
+| CPU Mongoose | vdd_mngs | registre |
+|---|---|---|
+| 728 MHz (bootloader) | 675 mV | état boot |
+| **1 976 MHz** | **912,5 mV** | `0x62` |
+| 2 288 MHz | 993,75 mV | `0x6f` |
+| **2 600 MHz** | **1 075 mV** | `0x7c` |
+
+| GPU Mali | vdd_g3d | registre |
+|---|---|---|
+| **338 MHz** | **600 mV** | `0x30` |
+| 390 / 419 MHz | 612,5 mV | `0x32` |
+| **546 MHz** | **662,5 mV** | `0x3a` |
+| 600 MHz | 681,25 mV | `0x3d` |
+| **650 MHz** | **700 mV** | `0x40` |
+
+### Source d'alimentation
+
+- Pas de pilote chargeur : `herolte_fg_read()` (MAX77854 à `0x36`) donne
+  `mA`, positif en charge. `herolte_battery.c` publie le dernier
+  `herolte_fg_mv`/`herolte_fg_ma` (un seul utilisateur I2C).
+- `hg_power_thread` : `ma > 20` = secteur, `ma < -20` = batterie, sinon
+  garde l'état (hystérésis, pour une batterie pleine sur secteur).
+- `vbat` = moyenne de 5 échantillons **distincts** (la jauge met à jour
+  environ une fois par seconde).
+
+### Profils
+
+| État | CPU Mongoose | GPU Mali | idle → 728 |
+|---|---|---|---|
+| Secteur | 2 600 MHz | 650 MHz | 3 s |
+| Batterie | **1 976 MHz** | **546 MHz** | **1,8 s** |
+| Batterie < 3 550 mV | 1 976 MHz | **419 MHz** | 1,8 s |
+| Écran off / SoC chaud | 728 MHz | 338 MHz | — |
+
+### Code
+
+- `hc_go_rate()` : n'importe quel palier de `hc_rates[]` ; en montée la
+  tension puis EMA/diviseurs/switch/PLL, en descente l'inverse.
+- `hc_go_low()` : état bootloader exact (728 MHz, 675 mV).
+- `hg_gpu_cap` : le réveil DCS utilise le plafond courant, pas 650 fixe.
+- Logs : `HEROLTE PWR: src=bat|ac cap_cpu=… cap_gpu=… vbat=…mV` à chaque
+  changement, et la ligne 60 s `HEROLTE POWER` porte src/vbat/cap.
+
+### Image
+
+`build/xnu-boot-pwr2.img`, sha256 à compléter (build `43736632527`).
+
+### Chantier 1
+
+**Terminé** : pwr1 (DCS `0x28`/`0x10`/`0x11`/`0x29`, GPU 338/650) + pwr2
+(plafonds batterie, anti-UVLO, jauge lissée). Validation sur téléphone à
+faire après le flash.
+
+---
+
 *Fin du document. Il est délibérément exhaustif : son but est qu'aucune des
 vingt heures de mesure de cette session ne soit à refaire.*
