@@ -1,0 +1,409 @@
+diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_bt.c
+@@ -0,0 +1,378 @@
++/*
++ * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) BCM4359 Bluetooth, step 1:
++ * hardware bring-up and HCI H4, no iOS stack yet.
++ *
++ * The combo's Bluetooth half is on UART1 0x14C20000, pins GPE0-0..3
++ * (function 2, pull-up, drive 3, the DTB uart1-default), with the control
++ * lines of the DTB bluetooth node: BT_REG_ON GPJ1-7 (PERIC1 0x14CC0000
++ * +0x60), BT_WAKE GPI2-3 (FSYS0 0x10E60000 +0x20), BT_HOST_WAKE GPA2-3
++ * (ALIVE 0x10580000 +0x40, input).  The firmware is the phone's own,
++ * bcm4359C0_semco.hcd from VENDOR, in the drop zone at
++ * /private/var/herolte/bt/bcm4359.hcd.
++ *
++ * Boot-arg herobt=0 disables everything.
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define BT_UART_PA      0x14C20000u
++#define BT_PERIC1_PA    0x14CC0000u
++#define BT_FSYS0_PA     0x10E60000u
++#define BT_ALIVE_PA     0x10580000u
++
++/* Samsung UART, the same offsets as bsd/dev/herolte_touch.c's HSI2C block. */
++#define UART_ULCON      0x00
++#define UART_UCON       0x04
++#define UART_UFCON      0x08
++#define UART_UMCON      0x0c
++#define UART_UTRSTAT    0x10
++#define UART_UERSTAT    0x14
++#define UART_UFSTAT     0x18
++#define UART_UMSTAT     0x1c
++#define UART_UTXH       0x20
++#define UART_URXH       0x24
++#define UART_UBRDIV     0x28
++#define UART_UFRACVAL   0x2c
++
++#define BT_FW_MAX       (128u * 1024u)
++#define BT_FW_PATH      "/private/var/herolte/bt/bcm4359.hcd"
++
++/* One log line: the kernel's printf has no newline in these formats. */
++#define BT_LOG(...) do { printf(__VA_ARGS__); printf("%c", 10); } while (0)
++
++static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
++static bool bt_started;
++static int bt_sleep;
++
++static uint32_t
++bt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bt_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++bt_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++bt_pin_fn(vm_offset_t base, uint32_t con, unsigned pin, uint32_t fn)
++{
++	uint32_t v = bt_rd(base, con);
++	v = (v & ~(0xfu << (pin * 4))) | ((fn & 0xfu) << (pin * 4));
++	bt_wr(base, con, v);
++}
++
++static void
++bt_pin_pud(vm_offset_t base, uint32_t pud, unsigned pin, uint32_t pull)
++{
++	uint32_t v = bt_rd(base, pud);
++	v = (v & ~(0x3u << (pin * 2))) | ((pull & 0x3u) << (pin * 2));
++	bt_wr(base, pud, v);
++}
++
++/* Function 1, no pull, driven.  con/dat/pud are the bank's register offsets. */
++static void
++bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned pin, int value)
++{
++	bt_pin_pud(base, pud, pin, 0);
++	bt_pin_fn(base, con, pin, 1);
++	uint32_t v = bt_rd(base, dat);
++	v = value ? (v | (1u << pin)) : (v & ~(1u << pin));
++	bt_wr(base, dat, v);
++}
++
++static bool
++bt_tx_byte(uint8_t b)
++{
++	for (unsigned i = 0; i < 20000; i++) {
++		if (bt_rd(bt_uart, UART_UTRSTAT) & 2u) {        /* TX buffer empty */
++			bt_wr(bt_uart, UART_UTXH, b);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static int
++bt_rx_byte(void)
++{
++	if (!(bt_rd(bt_uart, UART_UTRSTAT) & 1u)) {             /* RX ready */
++		return -1;
++	}
++	return (int)(bt_rd(bt_uart, UART_URXH) & 0xffu);
++}
++
++/*
++ * One HCI command, H4 0x01, and optionally its Command Complete.  The reply
++ * buffer gets the return parameters (status first), as the caller expects.
++ */
++static bool
++bt_hci_cmd(uint16_t op, const uint8_t *data, uint8_t len, uint8_t *reply,
++    uint8_t *reply_len, unsigned timeout_ms)
++{
++	uint8_t h[4] = { 0x01, (uint8_t)op, (uint8_t)(op >> 8), len };
++	uint64_t deadline;
++	uint8_t buf[320];
++	unsigned n = 0;
++
++	if (!bt_tx_byte(h[0]) || !bt_tx_byte(h[1]) || !bt_tx_byte(h[2]) ||
++	    !bt_tx_byte(h[3])) {
++		return false;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		if (!bt_tx_byte(data[i])) {
++			return false;
++		}
++	}
++	if (reply == NULL && reply_len == NULL) {
++		return true;
++	}
++	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		int c = bt_rx_byte();
++		if (c < 0) {
++			bt_msleep(1);
++			continue;
++		}
++		if (n < sizeof(buf)) {
++			buf[n++] = (uint8_t)c;
++		}
++		while (n >= 3 && buf[0] == 0x04) {
++			unsigned plen = buf[2];
++			if (n < 3 + plen) {
++				break;
++			}
++			if (buf[1] == 0x0e && plen >= 3) {
++				uint16_t evop = (uint16_t)(buf[4] | (buf[5] << 8));
++				if (evop == op) {
++					if (reply != NULL && reply_len != NULL) {
++						unsigned rl = plen - 3;
++						if (rl > *reply_len) {
++							rl = *reply_len;
++						}
++						memcpy(reply, &buf[6], rl);
++						*reply_len = (uint8_t)rl;
++					}
++					return true;
++				}
++			}
++			memmove(buf, &buf[3 + plen], n - (3 + plen));
++			n -= 3 + plen;
++		}
++	}
++	return false;
++}
++
++/* The .hcd is opcode(2) + length(1) + data, as VENDOR ships it. */
++static void
++bt_download(const uint8_t *fw, uint32_t len)
++{
++	uint32_t off = 0;
++	unsigned cmds = 0, failed = 0;
++
++	while (off + 3 <= len) {
++		uint16_t op = (uint16_t)(fw[off] | (fw[off + 1] << 8));
++		uint8_t l = fw[off + 2];
++		if (off + 3 + l > len) {
++			break;
++		}
++		uint8_t dummy[8];
++		uint8_t dl = sizeof(dummy);
++		if (!bt_hci_cmd(op, &fw[off + 3], l, dummy, &dl, 50)) {
++			failed++;
++		}
++		cmds++;
++		off += 3 + l;
++		if (op == 0xfc4e) {                             /* Launch RAM */
++			bt_msleep(250);
++		}
++	}
++	BT_LOG("HEROLTE BT: fw commands=%u failed=%u bytes=%u", cmds, failed, len);
++}
++
++/* The whole of a drop-zone file; its length, or 0. */
++static uint32_t
++bt_read_file(const char *path, void *buf, uint32_t max)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0;
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)max, 0,
++		    UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		vnode_close(vp, FREAD, ctx);
++	}
++	if (error != 0) {
++		BT_LOG("HEROLTE BT: %s error %d", path, error);
++		return 0;
++	}
++	return max - (uint32_t)resid;
++}
++
++static void
++bt_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t reply[64];
++	uint8_t rlen;
++	uint32_t ulcon, ucon, ufcon, umcon, ubrdiv, ufrac;
++	unsigned events = 0;
++
++	/* The rootfs and the drop zone are up by then. */
++	bt_msleep(5000);
++	bt_uart = ml_io_map(BT_UART_PA, 0x1000);
++	bt_peric1 = ml_io_map(BT_PERIC1_PA, 0x1000);
++	bt_fsys0 = ml_io_map(BT_FSYS0_PA, 0x1000);
++	bt_alive = ml_io_map(BT_ALIVE_PA, 0x1000);
++	if (!bt_uart || !bt_peric1 || !bt_fsys0 || !bt_alive) {
++		BT_LOG("HEROLTE BT: mapping failed");
++		return;
++	}
++	/* UART1: GPE0-0..3, function 2, pull-up, drive 3 (DTB uart1-default). */
++	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
++	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
++	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
++	/* BT_REG_ON low, BT_WAKE high, BT_REG_ON high, 150 ms. */
++	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
++	bt_msleep(20);
++	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
++	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
++	bt_msleep(150);
++	bt_pin_fn(bt_alive, 0x40, 3, 0);                        /* host wake, input */
++	BT_LOG("HEROLTE BT: uart=0x%x reg_on=1 wake=1 host_wake=%d",
++	    BT_UART_PA, (int)((bt_rd(bt_alive, 0x44) >> 3) & 1u));
++	/* What the bootloader left, then 8N1 with RTS/CTS. */
++	ulcon = bt_rd(bt_uart, UART_ULCON);
++	ucon = bt_rd(bt_uart, UART_UCON);
++	ufcon = bt_rd(bt_uart, UART_UFCON);
++	umcon = bt_rd(bt_uart, UART_UMCON);
++	ubrdiv = bt_rd(bt_uart, UART_UBRDIV);
++	ufrac = bt_rd(bt_uart, UART_UFRACVAL);
++	BT_LOG("HEROLTE BT: uart as found ulcon=%#x ucon=%#x ufcon=%#x umcon=%#x ubrdiv=%u ufrac=%u",
++	    ulcon, ucon, ufcon, umcon, ubrdiv, ufrac);
++	bt_wr(bt_uart, UART_ULCON, 0x3);
++	bt_wr(bt_uart, UART_UFCON, 0x7);                        /* reset both FIFOs */
++	bt_wr(bt_uart, UART_UFCON, 0x111);                      /* FIFO, 4/4 trigger */
++	bt_wr(bt_uart, UART_UMCON, 0x1);                        /* AFC/RTS */
++	if (ucon == 0 || ucon == 0xffffffffu) {
++		ucon = 0x3c5;
++	}
++	bt_wr(bt_uart, UART_UCON, ucon);
++	if (ubrdiv == 0 || ubrdiv > 1000) {
++		ubrdiv = 53;                                    /* 115200 from 100 MHz */
++		ufrac = 20;
++	}
++	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
++	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
++	bt_msleep(10);
++	/* HCI_Reset, minidriver, .hcd, reset again. */
++	rlen = sizeof(reply);
++	bool reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
++	BT_LOG("HEROLTE BT: reset ok=%d", reset);
++	if (!reset) {
++		BT_LOG("HEROLTE BT: no HCI answer, stopping");
++		return;
++	}
++	uint8_t dummy[8];
++	uint8_t dl = sizeof(dummy);
++	bool mini = bt_hci_cmd(0xfc2e, NULL, 0, dummy, &dl, 200);
++	BT_LOG("HEROLTE BT: minidriver ok=%d", mini);
++	uint8_t *fw = (uint8_t *)kalloc(BT_FW_MAX);
++	uint32_t fwlen = 0;
++	if (fw != NULL) {
++		fwlen = bt_read_file(BT_FW_PATH, fw, BT_FW_MAX);
++		BT_LOG("HEROLTE BT: fw bytes=%u", fwlen);
++		if (fwlen) {
++			bt_download(fw, fwlen);
++		}
++		kfree(fw, BT_FW_MAX);
++	} else {
++		BT_LOG("HEROLTE BT: no memory for the firmware");
++	}
++	rlen = sizeof(reply);
++	reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
++	BT_LOG("HEROLTE BT: reset2 ok=%d", reset);
++	rlen = sizeof(reply);
++	if (bt_hci_cmd(0x1009, NULL, 0, reply, &rlen, 300) && rlen >= 7) {
++		BT_LOG("HEROLTE BT: bdaddr=%02x:%02x:%02x:%02x:%02x:%02x",
++		    reply[1], reply[2], reply[3], reply[4], reply[5], reply[6]);
++	} else {
++		BT_LOG("HEROLTE BT: bdaddr read failed");
++	}
++	rlen = sizeof(reply);
++	if (bt_hci_cmd(0x1001, NULL, 0, reply, &rlen, 300) && rlen >= 9) {
++		BT_LOG("HEROLTE BT: hci ver=%#x rev=%#x lmp=%#x",
++		    reply[1], reply[2] | (reply[3] << 8), reply[4] | (reply[5] << 8));
++	}
++	/* Drain what the chip sends, and keep the line alive. */
++	for (;;) {
++		int c = bt_rx_byte();
++		if (c >= 0) {
++			if (c == 0x04 && events < 32) {
++				BT_LOG("HEROLTE BT: hci event byte=%#x", c);
++				events++;
++			}
++			continue;
++		}
++		bt_msleep(events < 32 ? 5 : 20);
++	}
++}
++
++void
++herolte_bt_probe(void)
++{
++	thread_t thread;
++	int enabled = 1;
++
++	if (bt_started) {
++		return;
++	}
++	bt_started = true;
++	(void)PE_parse_boot_argn("herobt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		BT_LOG("HEROLTE BT: disabled");
++		return;
++	}
++	BT_LOG("HEROLTE BT: probe");
++	kern_return_t kr = kernel_thread_start(bt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		BT_LOG("HEROLTE BT: thread start failed %d", kr);
++	}
++}
++#endif
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6bd143b..b1945c9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
+ bsd/dev/herolte_touchkey.c		standard
++bsd/dev/herolte_bt.c			standard
+ bsd/dev/herolte_gpu.c			standard
+ bsd/dev/herolte_drop.c			standard
+ bsd/dev/herolte_drop_core.c		standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 3c452f7..c67c6d8 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -778,6 +778,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* Capacitive touchkeys: ABOV on the bit-banged i2c@20. */
+ 	extern void herolte_touchkey_probe(void);
+ 	herolte_touchkey_probe();
++	/* BCM4359 Bluetooth: UART1, HCI H4, the .hcd from the drop zone. */
++	extern void herolte_bt_probe(void);
++	herolte_bt_probe();
+ 	/* sec_ts on the Exynos 8890 HSI2C (bsd/dev/herolte_touch.c). */
+ 	extern void herolte_touch_probe(void);
+ 	herolte_touch_probe();
