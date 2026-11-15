@@ -646,5 +646,50 @@ python3 tools/herolte-log-pull.py adb build/boot.txt
 
 ---
 
+## 18. Veille et consommation (pwr1)
+
+### Ce qui existait déjà
+
+- `SweetFramebuffer.cpp`, `kSweetFBRequestPowerChange` : noir en un tick,
+  timer vsync ralenti à 5 Hz, `herolte_screen_off_at` posé.
+- `herolte_gpu.c`, `hg_power_thread` : après 3 s écran éteint, Mongoose
+  revient aux valeurs du bootloader (728 MHz, 675 mV) ; il remonte à
+  2 600 MHz au rallumage. Les A53 ne bougent pas.
+- **Aucun envoi DCS** : le DSIM `0x13900000` n'était que sondé, et
+  `SweetFramebuffer` se contentait de noircir la frame.
+
+### Ce que pwr1 ajoute (patch `0350`)
+
+- `herolte_panel_power(bool on)`, appelé sur un vrai changement d'état.
+- **Sleep** : DCS `0x28`, 20 ms, `0x10`, 50 ms, GPU → 338 MHz (PLL puis
+  tension).
+- **Wake** : GPU → 650 MHz (tension puis PLL), réveil du thread de
+  puissance sur son canal dédié pour Mongoose avant la première frame,
+  DCS `0x11`, 120 ms, `0x29`, `fDirty` forcé.
+- `hg_clock_set` devient `hg_gpu_rate` (table 338…650) ; le boot reste à
+  650 MHz.
+- Journal : `HEROLTE PWR: sleep cpu=low(3s) gpu=338 dsi=28/10` et
+  `HEROLTE PWR: wake cpu=high gpu=650 dsi=11/29`.
+
+### DSIM 8890 (Samsung `decon_8890`)
+
+- `PKTHDR 0x3c`, `FIFOCTRL 0x4c` bit 10 = header FIFO empty,
+  `INTSRC 0x34` bit 28 = PH FIFO empty, `CMD_CONFIG 0x78`.
+- DCS short write : `data_id 0x05`, `data0` = commande, en-tête =
+  `(cmd << 8) | 0x05`.
+
+### Image
+
+`build/xnu-boot-pwr1.img`, sha256 à compléter après le build `43730604193`.
+
+### Test
+
+Écran allumé → Power : le journal doit montrer `sleep`, le GPU à 338, puis
+`Mongoose to 728 MHz (screen off…)` après 3 s. Power : `wake`, GPU 650,
+Mongoose 2 600 avant la première frame. Vérifier l'absence d'artefact et
+le réveil instantané.
+
+---
+
 *Fin du document. Il est délibérément exhaustif : son but est qu'aucune des
 vingt heures de mesure de cette session ne soit à refaire.*
