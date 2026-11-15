@@ -1,8 +1,23 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..54de9a4 100644
+index 26fefa3..abced63 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
-@@ -61,6 +61,41 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
+@@ -33,7 +33,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define BT_UART_PA      0x14C20000u
+-#define BT_PERIC1_PA    0x14CC0000u
++#define BT_PERIC0_PA    0x14C00000u     /* GPE0 bank: UART1's own pins */
++#define BT_PERIC1_PA    0x14CC0000u     /* GPJ1 bank: BT_REG_ON at +0x60 */
+ #define BT_FSYS0_PA     0x10E60000u
+ #define BT_ALIVE_PA     0x10580000u
+ 
+@@ -57,10 +58,45 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* One log line: the kernel's printf has no newline in these formats. */
+ #define BT_LOG(...) do { printf(__VA_ARGS__); printf("%c", 10); } while (0)
+ 
+-static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
++static vm_offset_t bt_uart, bt_peric0, bt_peric1, bt_fsys0, bt_alive;
  static bool bt_started;
  static int bt_sleep;
  
@@ -44,7 +59,7 @@ index 26fefa3..54de9a4 100644
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +148,178 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +149,178 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -223,7 +238,7 @@ index 26fefa3..54de9a4 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +456,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,62 +457,140 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -231,12 +246,33 @@ index 26fefa3..54de9a4 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,45 +472,106 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
- 	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
- 	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
- 	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
+ 	bt_msleep(5000);
+ 	bt_uart = ml_io_map(BT_UART_PA, 0x1000);
++	bt_peric0 = ml_io_map(BT_PERIC0_PA, 0x1000);
+ 	bt_peric1 = ml_io_map(BT_PERIC1_PA, 0x1000);
+ 	bt_fsys0 = ml_io_map(BT_FSYS0_PA, 0x1000);
+ 	bt_alive = ml_io_map(BT_ALIVE_PA, 0x1000);
+-	if (!bt_uart || !bt_peric1 || !bt_fsys0 || !bt_alive) {
++	if (!bt_uart || !bt_peric0 || !bt_peric1 || !bt_fsys0 || !bt_alive) {
+ 		BT_LOG("HEROLTE BT: mapping failed");
+ 		return;
+ 	}
+ 	/* UART1: GPE0-0..3, function 2, pull-up, drive 3 (DTB uart1-default). */
+-	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
+-	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
+-	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
 -	/* BT_REG_ON low, BT_WAKE high, BT_REG_ON high, 150 ms. */
 -	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
++	/*
++	 * (0372) UART1's pins are GPE0-0..3 in PERIC0.  They were being written into
++	 * PERIC1 bank 0 instead: the bank stride on this SoC is 0x20, which
++	 * herolte_touchkey.c relies on (GPE5 at +0x20, GPA0 at +0x00, GPA3 at
++	 * +0x60), so 0x14CC0000+0x00 is a GPIO bank and not the UART's pin group.
++	 * The 0x2222 meant for GPE0 landed on unrelated pads.
++	 */
++	bt_wr(bt_peric0, 0x00, (bt_rd(bt_peric0, 0x00) & ~0xffffu) | 0x2222u);
++	bt_wr(bt_peric0, 0x08, (bt_rd(bt_peric0, 0x08) & ~0xffu) | 0xffu);
++	bt_wr(bt_peric0, 0x0c, (bt_rd(bt_peric0, 0x0c) & ~0xffu) | 0xffu);
 +	/* (0356) The block's own clock, before anything is written to it. */
 +	bt_uart_clock();
 +	/*
@@ -258,8 +294,8 @@ index 26fefa3..54de9a4 100644
 +	 * enough for the chip's ROM to come up and drive HOST_WAKE.
 +	 */
 +	bt_power_rails();
-+	bt_pin_fn(bt_peric1, 0x00, 7, 1);                       /* GPJ1-7 bt-en: output */
-+	bt_pin_pud(bt_peric1, 0x08, 7, 1);                      /* pull-down */
++	bt_pin_fn(bt_peric1, 0x60, 7, 1);                       /* GPJ1-7 bt-en: output */
++	bt_pin_pud(bt_peric1, 0x68, 7, 1);                      /* pull-down */
 +	bt_pin_fn(bt_fsys0, 0x00, 3, 1);                        /* GPI2-3 bt-wake */
 +	/*
 +	 * (0371) BT_WAKE is a level input on the BCM4359, and holding it high
@@ -300,17 +336,26 @@ index 26fefa3..54de9a4 100644
 -	bt_wr(bt_uart, UART_UMCON, 0x1);                        /* AFC/RTS */
 -	if (ucon == 0 || ucon == 0xffffffffu) {
 -		ucon = 0x3c5;
--	}
++	bt_msleep(100);
++	{
++		/* (0372) Function nibbles next to the latches: a pad on function 2
++		 * shows its DAT bit while driving nothing, which is the pair bt9
++		 * logged.  These are the correct bank offsets at last. */
++		unsigned fn7 = (bt_rd(bt_peric1, 0x60) >> 28) & 0xfu;
++		unsigned fn3 = (bt_rd(bt_fsys0, 0x20) >> 12) & 0xfu;
++		BT_LOG("HEROLTE BT: pin fn GPJ1-7=%u(want 1) GPI2-3=%u(want 1)",
++		    fn7, fn3);
++		BT_LOG("HEROLTE BT: reg_on con=%#x dat=%#x pud=%#x | wake con=%#x "
++		    "dat=%#x pud=%#x | hostwake con=%#x dat=%#x",
++		    bt_rd(bt_peric1, 0x60), bt_rd(bt_peric1, 0x64),
++		    bt_rd(bt_peric1, 0x68), bt_rd(bt_fsys0, 0x20),
++		    bt_rd(bt_fsys0, 0x24), bt_rd(bt_fsys0, 0x28),
++		    bt_rd(bt_alive, 0x40), bt_rd(bt_alive, 0x44));
+ 	}
 -	bt_wr(bt_uart, UART_UCON, ucon);
 -	if (ubrdiv == 0 || ubrdiv > 1000) {
 -		ubrdiv = 53;                                    /* 115200 from 100 MHz */
 -		ufrac = 20;
-+	bt_msleep(100);
-+	BT_LOG("HEROLTE BT: reg_on con=%#x dat=%#x pud=%#x | wake con=%#x dat=%#x "
-+	    "pud=%#x | hostwake con=%#x dat=%#x",
-+	    bt_rd(bt_peric1, 0x00), bt_rd(bt_peric1, 0x60), bt_rd(bt_peric1, 0x08),
-+	    bt_rd(bt_fsys0, 0x00), bt_rd(bt_fsys0, 0x20), bt_rd(bt_fsys0, 0x28),
-+	    bt_rd(bt_alive, 0x40), bt_rd(bt_alive, 0x44));
 +	/*
 +	 * (0356) Wait for the chip's own sign of life instead of a fixed sleep:
 +	 * BT_HOST_WAKE is driven low while it boots.  In bt1 the line read 0 just

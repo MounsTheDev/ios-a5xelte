@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..6d7c43f 100644
+index f08a35c..c65242b 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -56,7 +56,24 @@ index f08a35c..6d7c43f 100644
  
  static uint32_t
  fg_rd(vm_offset_t base, uint32_t off)
-@@ -164,6 +197,49 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+@@ -88,7 +121,15 @@ fg_bus_init(void)
+ 	fg_wr(fg_i2c, HSI2C_FS3, 0x000100f0u);
+ 	fg_wr(fg_i2c, HSI2C_SLA, 0x3cu);
+ 	fg_wr(fg_i2c, HSI2C_TRAILING, 0xfu);
+-	fg_wr(fg_i2c, HSI2C_CONF, 0x80000000u);
++	/*
++	 * (0373) 0x80000000 only sets AHB_CLK_SEL: it carries no timing fields at
++	 * all, so the controller ran with no SCL delay and returned shifted bytes.
++	 * bt9 logged top_id going 0x54 -> 0x41 -> 0xff and a vbat of 5100 mV,
++	 * which a 4.2 V cell cannot produce.  This is the value Linux's
++	 * i2c-exynos5 driver computes for fast mode on this peripheral clock:
++	 * AHB clock select, TX/RX delay and the divider.
++	 */
++	fg_wr(fg_i2c, HSI2C_CONF, 0xF803C1FFu);
+ 	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
+ }
+ 
+@@ -164,6 +205,49 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
  	return fg_message_at(FG_ADDR, receive, bytes, count, stop);
  }
  
@@ -106,7 +123,7 @@ index f08a35c..6d7c43f 100644
  static bool
  fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  {
-@@ -174,7 +250,10 @@ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
+@@ -174,7 +258,10 @@ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
@@ -118,7 +135,7 @@ index f08a35c..6d7c43f 100644
  	}
  	return false;
  }
-@@ -216,30 +295,295 @@ herolte_fg_init(void)
+@@ -216,30 +303,313 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -176,7 +193,7 @@ index f08a35c..6d7c43f 100644
 +	if (!fg_i2c) {
 +		lck_mtx_unlock(fg_mtx);
 +		return -1;
- 	}
++	}
 +	/*
 +	 * (0365) The MAX77854 is one chip with three I2C sub-addresses, and bt6
 +	 * proved which one holds what.  Reading 0x66 with a single byte now gives
@@ -202,6 +219,24 @@ index f08a35c..6d7c43f 100644
 +	bool st2_ok = fg_byte_at(0x25, 0x02, &st2);
 +	int16_t cur = 0;
 +	bool cur_ok = fg_charger_current(&cur);
++
++	/*
++	 * (0373) Reject a whole frame when the chip does not identify itself.
++	 * With no timing fields on HSI2C_CONF the controller returned shifted
++	 * bytes and bt9 acted on them: top_id went 0x54 -> 0x41 -> 0xff while
++	 * chg_ok/dtls tracked nothing, so the icon flipped on garbage.  A frame
++	 * that does not answer 0x54 at 0x66 is not data, it is noise, and noise
++	 * must never move the icon.
++	 */
++	uint8_t top_id = 0;
++	bool id_ok = fg_byte_at(0x66, 0x00, &top_id);
++	if (id_ok && top_id != 0x54) {
++		fg_bus_resync();
++	}
++	bool frame_ok = id_ok && top_id == 0x54;
++	if (!frame_ok) {
++		chg_ok = dtls_ok = st1_ok = st2_ok = cur_ok = false;
++	}
 +
 +	herolte_fg_ac_raw = chg;
 +	herolte_fg_dtls = dtls;
@@ -325,7 +360,7 @@ index f08a35c..6d7c43f 100644
 +
 +	if (!fg_i2c) {
 +		return 0;
-+	}
+ 	}
 +	(void)fg_byte_at(0x69, 0xB2, &a);
 +	(void)fg_byte_at(0x69, 0xB3, &b);
 +	(void)fg_byte_at(0x25, 0x02, &c);
@@ -430,7 +465,26 @@ index f08a35c..6d7c43f 100644
  		return -1;
  	}
  	/* (0330) TEMP 0x08: signed, 1/256 degree (the MAX17047 family's; Linux in TWRP read 30.6 C from it) */
-@@ -257,6 +601,7 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+@@ -251,12 +621,25 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	unsigned permille = ((unsigned)soc * 10u) >> 8;
+ 	unsigned p = (permille * 1000u / FG_CAPACITY_MAX + 5u) / 10u;
+ 	*percent = p > 100 ? 100 : p;
+-	*mv = (unsigned)(((uint64_t)vcell * 78125u) / 1000000u);
++	unsigned mv_now = (unsigned)(((uint64_t)vcell * 78125u) / 1000000u);
++	/*
++	 * (0373) A cell cannot sit outside 3.0-4.45 V, so a reading outside that
++	 * window is a corrupted frame, not a battery.  bt9 published 5100 mV once;
++	 * refusing it keeps one bad transaction out of the percentage and out of
++	 * the heat limit that reads herolte_fg_mv.
++	 */
++	if (mv_now < 3000u || mv_now > 4450u) {
++		fg_bus_resync();
++		lck_mtx_unlock(fg_mtx);
++		return -1;
++	}
++	*mv = mv_now;
+ 	*ma = (int)(((int64_t)(int16_t)current * 15625) / 100000);
+ 	herolte_fg_mv = *mv;
  	herolte_fg_ma = *ma;
  	*rem_mah = rem / 2u;
  	*full_mah = full / 2u;
