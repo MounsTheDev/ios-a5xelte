@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..2620387 100644
+index f08a35c..7a94bfd 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -10,7 +10,23 @@ index f08a35c..2620387 100644
  
  #define FG_HSI2C_PA     0x13650000u
  #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
-@@ -216,27 +217,97 @@ herolte_fg_init(void)
+@@ -48,6 +49,15 @@ volatile int herolte_fg_dtls;           /* CHG_DETAILS_00 byte */
+ #define HSI2C_FIFO_STAT 0x30
+ #define HSI2C_TX_DATA   0x34
+ #define HSI2C_RX_DATA   0x38
++/*
++ * (0362) The PMIC's own controller, hsi2c@10550000 in the devicetree.  It is
++ * not an offset from the charger's bus, it is a different controller, so the
++ * address is absolute.
++ */
++#define PMIC_HSI2C_PA    0x10550000u
++#define PMIC_PINS_PA     0x105A0000u    /* pinctrl@105A0000: etc0-1, etc0-0 */
++#define PMIC_ADDR        0x66
++
+ #define HSI2C_CONF      0x40
+ #define HSI2C_AUTO_CONF 0x44
+ #define HSI2C_TIMEOUT   0x48
+@@ -216,27 +226,196 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -90,29 +106,128 @@ index f08a35c..2620387 100644
 + * journal says which offset carries CHGIN.
 + */
 +void
-+herolte_fg_dump_charger(void)
++herolte_fg_dump_charger(const char *why)
 +{
-+	static const char *names[] = {
-+		"B0 int", "B1 int2", "B2 ok", "B3 dtls", "B4", "B5", "B6", "B7"
++	static const char *names[8] = {
++		"int", "int2", "ok", "dtls", "B4", "B5", "B6", "B7"
 +	};
 +
 +	if (!fg_i2c) {
-+		printf("HEROLTE FG: no i2c for the charger dump\n");
++		printf("HEROLTE FG: dump %s: no i2c\n", why);
 +		return;
 +	}
++	printf("HEROLTE FG: ---- dump (%s) ----\n", why);
 +	for (unsigned i = 0; i < 8; i++) {
 +		uint16_t v = 0;
 +		bool ok = fg_word_at(0x66, (uint8_t)(0xB0 + i), &v);
-+		printf("HEROLTE FG: 0x%02x %-7s = %#04x (%s)\n", 0xB0 + i,
-+		    names[i], (unsigned)v, ok ? "answered" : "no answer");
++		printf("HEROLTE FG: 0x66:0x%02x %-5s = %#04x (%s)\n",
++		    0xB0 + i, names[i], (unsigned)v, ok ? "answered" : "no answer");
 +	}
-+	/* The other address the port has a device node for, for the record. */
-+	for (unsigned i = 0; i < 4; i++) {
++	/*
++	 * The low window as well: an MUIC or a charger detail register that
++	 * flips with the cable can live below 0xB0, and this costs one boot.
++	 */
++	for (unsigned i = 0; i < 0x20; i++) {
 +		uint16_t v = 0;
-+		bool ok = fg_word_at(0x69, (uint8_t)(0xB0 + i), &v);
-+		printf("HEROLTE FG: 0x69:0x%02x = %#04x (%s)\n", 0xB0 + i,
++		bool ok = fg_word_at(0x66, (uint8_t)i, &v);
++		printf("HEROLTE FG: 0x66:0x%02x = %#04x (%s)\n", i, (unsigned)v,
++		    ok ? "answered" : "no answer");
++	}
++	/* The gauge half of the same chip, which is known to answer. */
++	for (unsigned i = 0; i < 3; i++) {
++		static const uint8_t greg[3] = { 0x00, 0x0A, 0x0B };
++		uint16_t v = 0;
++		bool ok = fg_word_at(0x36, greg[i], &v);
++		printf("HEROLTE FG: 0x36:0x%02x = %#04x (%s)\n", greg[i],
 +		    (unsigned)v, ok ? "answered" : "no answer");
++	}
++	printf("HEROLTE FG: ---- dump end ----\n");
++}
++
++/*
++ * (0361) A digest of the raw charger window, so the power thread can dump on
++ * any byte changing rather than on the derived plug state.  bt4 conditioned
++ * the dump on an edge in "ac", and ac could never change while 0xB2 read
++ * 0xff, so the dump never ran and told us nothing.
++ */
++/*
++ * (0362) The PMIC on the other HSI2C bus.  s2mps16 is at 0x66 on
++ * hsi2c@10550000, while the charger sits at 0x66 on hsi2c@13650000: two
++ * different buses, the same device address.  The Bluetooth side needs to
++ * read and, if necessary, set LDO28 (VREG_BT) and the 32 kHz enable, and this
++ * driver already owns a working HSI2C engine, so the two byte-sized helpers
++ * live here instead of a second copy of the protocol in herolte_bt.c.
++ */
++static vm_offset_t pmic_i2c;
++
++int
++herolte_pmic_setup(void)
++{
++	vm_offset_t pins;
++
++	if (pmic_i2c) {
++		return 0;
++	}
++	pmic_i2c = ml_io_map(PMIC_HSI2C_PA, 0x1000);
++	pins = ml_io_map(PMIC_PINS_PA, 0x1000);
++	if (!pmic_i2c || !pins) {
++		pmic_i2c = 0;
++		return -1;
++	}
++	/* ETC0-0 and ETC0-1 as function 2 (HSI2C), no pull: the DTB's hs-i2c15-bus. */
++	fg_wr(pins, 0x00, (fg_rd(pins, 0x00) & ~0xffu) | 0x22u);
++	fg_wr(pins, 0x08, (fg_rd(pins, 0x08) & ~0xfu) | 0x0u);
++	fg_wr(pmic_i2c, HSI2C_CTL, 0x80000009u);
++	fg_wr(pmic_i2c, HSI2C_CTL, 0x00000009u);
++	fg_wr(pmic_i2c, HSI2C_TIMEOUT, 0);
++	fg_wr(pmic_i2c, HSI2C_FS1, 0x78787800u);
++	fg_wr(pmic_i2c, HSI2C_FS2, 0x3c007878u);
++	fg_wr(pmic_i2c, HSI2C_CONF, 0x80000000u);
++	return 0;
++}
++
++int
++herolte_pmic_rd(uint8_t reg, uint8_t *value)
++{
++	uint8_t b[2];
++
++	if (!pmic_i2c) {
++		return -1;
  	}
++	if (!fg_message_at(PMIC_ADDR, false, &reg, 1, false) ||
++	    !fg_message_at(PMIC_ADDR, true, b, 2, true)) {
++		return -1;
++	}
++	*value = b[0];
++	return 0;
++}
++
++int
++herolte_pmic_wr(uint8_t reg, uint8_t value)
++{
++	uint8_t b[2];
++
++	if (!pmic_i2c) {
++		return -1;
++	}
++	b[0] = reg;
++	b[1] = value;
++	return fg_message_at(PMIC_ADDR, false, b, 2, true) ? 0 : -1;
++}
++
++unsigned
++herolte_fg_charger_digest(void)
++{
++	uint16_t b0 = 0, b2 = 0, b3 = 0;
++
++	if (!fg_i2c) {
++		return 0;
++	}
++	(void)fg_word_at(0x66, 0xB0, &b0);
++	(void)fg_word_at(0x66, 0xB2, &b2);
++	(void)fg_word_at(0x66, 0xB3, &b3);
++	return ((unsigned)(b0 & 0xff) << 16) | ((unsigned)(b2 & 0xff) << 8) |
++	    (unsigned)(b3 & 0xff);
 +}
 +
 +int
@@ -125,21 +240,22 @@ index f08a35c..2620387 100644
  	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
  	    !fg_word(FG_FULLCAP, &full)) {
 diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
-index 5fe437a..eb762d8 100644
+index 5fe437a..4d350db 100644
 --- a/bsd/dev/herolte_gpu.c
 +++ b/bsd/dev/herolte_gpu.c
-@@ -30,6 +30,10 @@ extern volatile int herolte_fg_ac;       /* MAX77854 CHGIN_OK */
+@@ -30,6 +30,11 @@ extern volatile int herolte_fg_ac;       /* MAX77854 CHGIN_OK */
  extern volatile int herolte_fg_ac_valid;
  extern volatile int herolte_fg_ac_raw;
  extern volatile int herolte_fg_dtls;
 +/* (0355) Two register reads on the charger MFD, for the plug-edge wake-up. */
 +extern int herolte_fg_charger(void);
-+/* (0360) One register map at each cable edge: which offset answers. */
-+extern void herolte_fg_dump_charger(void);
++/* (0361) The charger map, dumped for a reason, plus its raw digest. */
++extern void herolte_fg_dump_charger(const char *why);
++extern unsigned herolte_fg_charger_digest(void);
  void herolte_gpu_probe(void);
  /* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp. */
  int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
-@@ -72,6 +76,17 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+@@ -72,6 +77,17 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
  static int hg_sleep;
  static int hg_pwr_sleep;
  
@@ -157,7 +273,16 @@ index 5fe437a..eb762d8 100644
  static uint32_t
  hg_rd(vm_offset_t base, uint32_t off)
  {
-@@ -2617,6 +2632,26 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -2604,6 +2620,8 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 	int top = -1000, seen_max = -1000;
+ 	uint32_t cap_cpu = hc.mhz, cap_gpu = 650, logged_cpu = 0, logged_gpu = 0;
+ 	unsigned vbat_hist[5] = { 0 }, vbat_n = 0, last_mv = 0;
++	/* (0361) The raw charger bytes last dumped, and how many dumps so far. */
++	unsigned last_digest = 0, digest_n = 0;
+ 	for (;;) {
+ 		hg_pwr_msleep(200);
+ 		uint64_t now = mach_absolute_time(), off = herolte_screen_off_at, ns = 0;
+@@ -2617,6 +2635,42 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
  		unsigned mv = herolte_fg_mv;
  		/* Live charger state: no latch, battery on any failed read. */
  		bool ac = herolte_fg_ac_valid && herolte_fg_ac != 0;
@@ -173,13 +298,29 @@ index 5fe437a..eb762d8 100644
 +		if (herolte_fg_charger() == 0) {
 +			ac = herolte_fg_ac != 0;
 +		}
++		/*
++		 * (0361) Dump on the RAW bytes changing, not on the derived state.
++		 * bt4 gated this on an edge in "ac", which could never arrive while
++		 * 0xB2 read 0xff, so the instrument never ran and the journal said
++		 * nothing about the charger.
++		 */
++		unsigned digest = herolte_fg_charger_digest();
++		if (digest != last_digest) {
++			if (digest_n == 0) {
++				herolte_fg_dump_charger("first sample");
++			} else {
++				herolte_fg_dump_charger("raw bytes changed");
++			}
++			last_digest = digest;
++			digest_n++;
++		}
 +		if (ac != was_ac) {
 +			herolte_power_wake();
 +			printf("HEROLTE PWR: plug=%d (%s) ac_raw=%#x dtls=%#x vbat=%umV%s\n",
 +			    ac ? 1 : 0, ac ? "in" : "out",
 +			    (unsigned)herolte_fg_ac_raw, (unsigned)herolte_fg_dtls, mv,
 +			    (herolte_fg_ac_raw & 0xff) == 0xff ? " (no ack)" : "");
-+			herolte_fg_dump_charger();
++			herolte_fg_dump_charger("plug edge");
 +		}
  		if (mv != 0 && mv != last_mv) {
  			/* The gauge updates about once a second; five distinct samples. */

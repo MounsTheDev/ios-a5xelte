@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..16ab92c 100644
+index 26fefa3..ccf60ad 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
-@@ -61,6 +61,23 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
+@@ -61,6 +61,39 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
  static bool bt_started;
  static int bt_sleep;
  
@@ -23,10 +23,26 @@ index 26fefa3..16ab92c 100644
 + */
 +#define BT_CMU_PERIC1_PA 0x14C80000u    /* UART1 gate (0x800); written, never read */
 +
++/*
++ * (0362) The PMIC, through the HSI2C engine bsd/dev/herolte_battery.c already
++ * drives.  s2mps16 answers at 0x66 on hsi2c@10550000, a different controller
++ * from the charger's bus.
++ */
++extern int herolte_pmic_setup(void);
++extern int herolte_pmic_rd(uint8_t reg, uint8_t *value);
++extern int herolte_pmic_wr(uint8_t reg, uint8_t value);
++
++/* s2mps16 regulator control: LDO28 is VREG_BT, always-on and boot-on in the DTB. */
++#define PMIC_LDO28_CTRL 0x64
++#define PMIC_LDO28_ON   (1u << 6)
++/* The 32 kHz gate the combo chip needs for its sleep clock. */
++#define PMIC_32K_CTRL   0x00
++#define PMIC_32K_BT     (1u << 2)
++
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +130,121 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +146,157 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -61,6 +77,42 @@ index 26fefa3..16ab92c 100644
 + * kept: the block is written, never read.
 + */
 +static unsigned bt_uart_src;
++
++/*
++ * (0362) The two things the devicetree promises and nothing ever verified:
++ * VREG_BT (s2mps16 LDO28, 2.8 V, "regulator-always-on") and the chip's 32 kHz
++ * sleep clock.  "always-on" is a policy in the kernel, not a measurement, and
++ * a BCM4359 without LPO does not boot its ROM, does not drive HOST_WAKE and
++ * does not answer HCI.  Both are read, logged, and only written when the bit
++ * says off.
++ */
++static void
++bt_power_rails(void)
++{
++	uint8_t ldo = 0, clk = 0;
++	int ldo_ok = -1, clk_ok = -1;
++
++	if (herolte_pmic_setup() != 0) {
++		BT_LOG("HEROLTE BT: pmic unavailable, rails unread");
++		return;
++	}
++	ldo_ok = herolte_pmic_rd(PMIC_LDO28_CTRL, &ldo);
++	clk_ok = herolte_pmic_rd(PMIC_32K_CTRL, &clk);
++	BT_LOG("HEROLTE BT: pmic ldo28=%#x%s 32k=%#x%s (before)",
++	    ldo, ldo_ok == 0 ? "" : "?", clk, clk_ok == 0 ? "" : "?");
++	if (ldo_ok == 0 && !(ldo & PMIC_LDO28_ON)) {
++		(void)herolte_pmic_wr(PMIC_LDO28_CTRL, (uint8_t)(ldo | PMIC_LDO28_ON));
++		BT_LOG("HEROLTE BT: ldo28 was off, set on");
++	}
++	if (clk_ok == 0 && !(clk & PMIC_32K_BT)) {
++		(void)herolte_pmic_wr(PMIC_32K_CTRL, (uint8_t)(clk | PMIC_32K_BT));
++		BT_LOG("HEROLTE BT: 32k bt bit was off, set on");
++	}
++	if (ldo_ok == 0 && herolte_pmic_rd(PMIC_LDO28_CTRL, &ldo) == 0 &&
++	    clk_ok == 0 && herolte_pmic_rd(PMIC_32K_CTRL, &clk) == 0) {
++		BT_LOG("HEROLTE BT: pmic ldo28=%#x 32k=%#x (after)", ldo, clk);
++	}
++}
 +
 +/*
 + * (0356) Open the UART's clock: the CMU gate, a clock source, a divisor, then
@@ -148,7 +200,7 @@ index 26fefa3..16ab92c 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +381,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +433,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -156,7 +208,7 @@ index 26fefa3..16ab92c 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,38 +397,52 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,38 +449,53 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
@@ -186,6 +238,7 @@ index 26fefa3..16ab92c 100644
 +	 * BT_WAKE high first, then BT_REG_ON released, then a settle long
 +	 * enough for the chip's ROM to come up and drive HOST_WAKE.
 +	 */
++	bt_power_rails();
 +	bt_pin_fn(bt_peric1, 0x00, 7, 1);                       /* GPJ1-7 bt-en: output */
 +	bt_pin_pud(bt_peric1, 0x08, 7, 1);                      /* pull-down */
 +	bt_pin_fn(bt_fsys0, 0x00, 3, 1);                        /* GPI2-3 bt-wake */
