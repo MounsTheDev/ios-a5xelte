@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..627ecb9 100644
+index f08a35c..6d7c43f 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -26,7 +26,7 @@ index f08a35c..627ecb9 100644
  #define HSI2C_CONF      0x40
  #define HSI2C_AUTO_CONF 0x44
  #define HSI2C_TIMEOUT   0x48
-@@ -59,6 +69,20 @@ volatile int herolte_fg_dtls;           /* CHG_DETAILS_00 byte */
+@@ -59,6 +69,29 @@ volatile int herolte_fg_dtls;           /* CHG_DETAILS_00 byte */
  #define HSI2C_ADDR      0x70
  
  static vm_offset_t fg_i2c, fg_pins;
@@ -44,10 +44,19 @@ index f08a35c..627ecb9 100644
 +static LCK_MTX_DECLARE(fg_mtx_store, &fg_grp);
 +#define fg_mtx (&fg_mtx_store)
 +static void fg_bus_resync(void);
++int herolte_fg_current_mA(void);      /* (0370) defined below, used on the miss path */
++/*
++ * (0370) Consecutive failed charger reads.  bt8 froze the bolt on for good
++ * after one dead transaction (journal line 4354: SWEET BATTERY plug out
++ * ac_raw=0 dtls=0, read failed), because the failure path left herolte_fg_ac at its last
++ * value -- and that value was 1.  The read failing is not evidence of a
++ * cable; holding a stale 1 forever is the bug.
++ */
++static unsigned fg_chg_misses;
  
  static uint32_t
  fg_rd(vm_offset_t base, uint32_t off)
-@@ -164,6 +188,49 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+@@ -164,6 +197,49 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
  	return fg_message_at(FG_ADDR, receive, bytes, count, stop);
  }
  
@@ -97,7 +106,7 @@ index f08a35c..627ecb9 100644
  static bool
  fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  {
-@@ -174,7 +241,10 @@ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
+@@ -174,7 +250,10 @@ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  			*value = (uint16_t)(b[0] | (b[1] << 8));
  			return true;
  		}
@@ -109,7 +118,7 @@ index f08a35c..627ecb9 100644
  	}
  	return false;
  }
-@@ -216,30 +286,262 @@ herolte_fg_init(void)
+@@ -216,30 +295,295 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -167,7 +176,7 @@ index f08a35c..627ecb9 100644
 +	if (!fg_i2c) {
 +		lck_mtx_unlock(fg_mtx);
 +		return -1;
-+	}
+ 	}
 +	/*
 +	 * (0365) The MAX77854 is one chip with three I2C sub-addresses, and bt6
 +	 * proved which one holds what.  Reading 0x66 with a single byte now gives
@@ -207,6 +216,7 @@ index f08a35c..627ecb9 100644
 +	 * different moment; only all three silent means no cable.
 +	 */
 +	if (chgin || vbvolt || charging_now) {
++		fg_chg_misses = 0;
 +		herolte_fg_ac_valid = 1;
 +		herolte_fg_ac = 1;
 +		lck_mtx_unlock(fg_mtx);
@@ -214,10 +224,42 @@ index f08a35c..627ecb9 100644
 +	}
 +	if (chg_ok || st2_ok || cur_ok) {
 +		/* The blocks answered and none of them sees power: a real "out". */
++		fg_chg_misses = 0;
 +		herolte_fg_ac_valid = 1;
 +		herolte_fg_ac = 0;
 +		lck_mtx_unlock(fg_mtx);
 +		return 0;
++	}
++	/*
++	 * (0370) Every block failed to answer.  Do not leave the published state
++	 * alone: that is what pinned the icon to "charging" for the rest of the
++	 * boot in bt8.  The gauge is the one block that keeps answering when the
++	 * charger does not (bt6 read 0x36:0x0A while 0x66 returned all ones), so
++	 * ask it about the current -- no current flowing in means no cable.  If
++	 * even that fails, two misses in a row is enough to say "out"; a cable
++	 * that is really in will be seen again on the very next 200 ms poll.
++	 */
++	fg_chg_misses++;
++	{
++		/*
++		 * herolte_fg_current_mA() returns 0 both for no current and for
++		 * the gauge not answering, and here the distinction does not change
++		 * the answer: without a readable current we fall through to the
++		 * miss counter below.
++		 */
++		int ma = herolte_fg_current_mA();
++		if (ma < 0) {
++			herolte_fg_ac_valid = 1;
++			herolte_fg_ac = 0;
++			lck_mtx_unlock(fg_mtx);
++			return 0;
++		}
++		if (fg_chg_misses >= 2) {
++			herolte_fg_ac_valid = 1;
++			herolte_fg_ac = 0;
++			lck_mtx_unlock(fg_mtx);
++			return 0;
++		}
 +	}
 +	lck_mtx_unlock(fg_mtx);
 +	return -1;
@@ -342,7 +384,7 @@ index f08a35c..627ecb9 100644
 +			printf("HEROLTE PMIC: etc0 con=%#x dat=%#x pud=%#x\n",
 +			    fg_rd(pins, 0x00), fg_rd(pins, 0x04), fg_rd(pins, 0x08));
 +		}
- 	}
++	}
 +}
 +
 +int
@@ -388,7 +430,7 @@ index f08a35c..627ecb9 100644
  		return -1;
  	}
  	/* (0330) TEMP 0x08: signed, 1/256 degree (the MAX17047 family's; Linux in TWRP read 30.6 C from it) */
-@@ -257,6 +559,7 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+@@ -257,6 +601,7 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
  	herolte_fg_ma = *ma;
  	*rem_mah = rem / 2u;
  	*full_mah = full / 2u;

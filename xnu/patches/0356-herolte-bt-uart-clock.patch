@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..e4b430a 100644
+index 26fefa3..54de9a4 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
 @@ -61,6 +61,41 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
@@ -44,7 +44,7 @@ index 26fefa3..e4b430a 100644
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +148,170 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +148,178 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -185,7 +185,15 @@ index 26fefa3..e4b430a 100644
 +	 * bit 0 makes RTS say "ready to receive" on the pad, which is what the
 +	 * BCM4359 wants before it will transmit.
 +	 */
-+	bt_wr(bt_uart, UART_UMCON, 0x11);
++	/*
++	 * (0371) RTS asserted, auto flow control OFF.  0x11 set bit 4 (AFC) as
++	 * well, which makes the transmitter stop whenever CTS is high -- and if
++	 * the BCM4359 never drives CTS (it stays silent, as bt8's four-clock
++	 * sweep showed) then TX is gated shut and nothing is ever sent.  0x01
++	 * keeps RTS saying "ready to receive" without letting the chip's silence
++	 * block us.
++	 */
++	bt_wr(bt_uart, UART_UMCON, 0x01);
 +	/*
 +	 * Clock select on the PCLK, transmitter and receiver running, and the
 +	 * receive-timeout bits the bootloader already had.  They are polled, but the
@@ -215,7 +223,7 @@ index 26fefa3..e4b430a 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +448,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +456,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -223,16 +231,12 @@ index 26fefa3..e4b430a 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,45 +464,90 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,45 +472,106 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
 -	/* BT_REG_ON low, BT_WAKE high, BT_REG_ON high, 150 ms. */
 -	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
--	bt_msleep(20);
--	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
--	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
--	bt_msleep(150);
 +	/* (0356) The block's own clock, before anything is written to it. */
 +	bt_uart_clock();
 +	/*
@@ -257,19 +261,26 @@ index 26fefa3..e4b430a 100644
 +	bt_pin_fn(bt_peric1, 0x00, 7, 1);                       /* GPJ1-7 bt-en: output */
 +	bt_pin_pud(bt_peric1, 0x08, 7, 1);                      /* pull-down */
 +	bt_pin_fn(bt_fsys0, 0x00, 3, 1);                        /* GPI2-3 bt-wake */
++	/*
++	 * (0371) BT_WAKE is a level input on the BCM4359, and holding it high
++	 * across the reset is not the sequence the datasheet gives: the chip
++	 * samples it during power-on.  Drive it low while BT_REG_ON is released,
++	 * then raise it afterwards, which is a real edge the chip can see.
++	 */
++	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 0);          /* BT_WAKE low */
 +	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);         /* BT_REG_ON low */
-+	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);          /* BT_WAKE high */
 +	bt_msleep(50);
 +	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);         /* BT_REG_ON high */
+ 	bt_msleep(20);
+-	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
+-	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
+-	bt_msleep(150);
++	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);          /* BT_WAKE 0 -> 1 */
 +	/* The pad levels, not only the latches, before the chip is asked. */
-+	BT_LOG("HEROLTE BT: bt-en con=%#x dat=%#x pud=%#x; bt-wake con=%#x dat=%#x",
-+	    bt_rd(bt_peric1, 0x00), bt_rd(bt_peric1, 0x60), bt_rd(bt_peric1, 0x08),
-+	    bt_rd(bt_fsys0, 0x00), bt_rd(bt_fsys0, 0x20));
 +	/*
-+	 * (0356) Wait for the chip's own sign of life instead of a fixed sleep:
-+	 * BT_HOST_WAKE is driven low while it boots.  In bt1 the line read 0 just
-+	 * after the 150 ms sleep and the HCI_Reset was sent anyway; here the wait
-+	 * is bounded and the outcome is logged either way.
++	 * (0371) All three pads, read back after the settle, so the journal
++	 * shows the level each line is actually at rather than the value we
++	 * meant to write.
 +	 */
  	bt_pin_fn(bt_alive, 0x40, 3, 0);                        /* host wake, input */
 -	BT_LOG("HEROLTE BT: uart=0x%x reg_on=1 wake=1 host_wake=%d",
@@ -294,6 +305,18 @@ index 26fefa3..e4b430a 100644
 -	if (ubrdiv == 0 || ubrdiv > 1000) {
 -		ubrdiv = 53;                                    /* 115200 from 100 MHz */
 -		ufrac = 20;
++	bt_msleep(100);
++	BT_LOG("HEROLTE BT: reg_on con=%#x dat=%#x pud=%#x | wake con=%#x dat=%#x "
++	    "pud=%#x | hostwake con=%#x dat=%#x",
++	    bt_rd(bt_peric1, 0x00), bt_rd(bt_peric1, 0x60), bt_rd(bt_peric1, 0x08),
++	    bt_rd(bt_fsys0, 0x00), bt_rd(bt_fsys0, 0x20), bt_rd(bt_fsys0, 0x28),
++	    bt_rd(bt_alive, 0x40), bt_rd(bt_alive, 0x44));
++	/*
++	 * (0356) Wait for the chip's own sign of life instead of a fixed sleep:
++	 * BT_HOST_WAKE is driven low while it boots.  In bt1 the line read 0 just
++	 * after the 150 ms sleep and the HCI_Reset was sent anyway; here the wait
++	 * is bounded and the outcome is logged either way.
++	 */
 +	/*
 +	 * (0367) The UART is configured BEFORE the chip is asked anything, and
 +	 * HOST_WAKE is no longer a gate on sending.
