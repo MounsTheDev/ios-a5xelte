@@ -313,6 +313,7 @@ struct eagl {
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
 	uint64_t upload_bytes, began, attaching, flushing;
+	uint64_t draw_us, draw_mesa_us;     /* (perf) time in the draw wrapper, and in Mesa's call inside it */
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
@@ -1313,10 +1314,9 @@ frame_end(struct eagl *e, bool finished)
 		    after - waited, e->attaching);
 		/* The line above is cut by the kernel log writer just before the attach time, which is the number that matters:
 		 * it is the time spent attaching IOSurfaces before any GL work. A short line of its own survives. */
-		say("hakios-gl: f%u: attach %llu us of %llu (flush %llu, wait %llu, copy %llu, rest %lld)\n",
-		    e->frames, e->attaching, after - e->began, e->flushing, waited - before, after - waited,
-		    (long long)(after - e->began) - (long long)e->attaching - (long long)e->flushing -
-		    (long long)(waited - before) - (long long)(after - waited));
+		say("hakios-gl: f%u: draw %llu/%llu us (wrapper/mesa), attach %llu, flush %llu, wait %llu, copy %llu, frame %llu\n",
+		    e->frames, e->draw_us, e->draw_mesa_us, e->attaching, e->flushing, waited - before, after - waited,
+		    after - e->began);
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
@@ -1328,6 +1328,7 @@ frame_end(struct eagl *e, bool finished)
 	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
 	e->upload_bytes = e->attaching = e->flushing = 0;
+	e->draw_us = e->draw_mesa_us = 0;
 }
 
 #ifndef GL_BLEND
@@ -3439,6 +3440,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	struct eagl *e = context;
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
+	uint64_t t0 = now_us(), tm = 0;
 
 	EAGL_ENTER(e, 0x210);
 	drawing(e);
@@ -3455,11 +3457,15 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: nothing is drawn, so that what this program puts there can be seen missing */
 	} else if (group_draw_begin(e, enabled)) {
+		uint64_t a = now_us();
 		glDrawArrays(mode, first, count);
+		tm += now_us() - a;
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		uint64_t a = now_us();
 		glDrawArrays(mode, first, count);
+		tm += now_us() - a;
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -3468,6 +3474,8 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		trace_placed_look(e);
 	}
 	EAGL_LEAVE(e, 0x210);
+	e->draw_us += now_us() - t0;
+	e->draw_mesa_us += tm;
 	if (eagl_tracing) {
 		trace_pixels(e);
 	}
@@ -3479,6 +3487,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	struct eagl *e = context;
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
+	uint64_t t0 = now_us(), tm = 0;
 
 	EAGL_ENTER(e, 0x220);
 	drawing(e);
@@ -3495,11 +3504,15 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: see my_glDrawArrays */
 	} else if (group_draw_begin(e, enabled)) {
+		uint64_t a = now_us();
 		glDrawElements(mode, count, type, indices);
+		tm += now_us() - a;
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		uint64_t a = now_us();
 		glDrawElements(mode, count, type, indices);
+		tm += now_us() - a;
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
@@ -3508,6 +3521,8 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		trace_placed_look(e);
 	}
 	EAGL_LEAVE(e, 0x220);
+	e->draw_us += now_us() - t0;
+	e->draw_mesa_us += tm;
 	if (eagl_tracing) {
 		trace_pixels(e);
 	}
