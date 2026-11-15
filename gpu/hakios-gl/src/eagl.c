@@ -1311,6 +1311,12 @@ frame_end(struct eagl *e, bool finished)
 		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
 		    after - waited, e->attaching);
+		/* The line above is cut by the kernel log writer just before the attach time, which is the number that matters:
+		 * it is the time spent attaching IOSurfaces before any GL work. A short line of its own survives. */
+		say("hakios-gl: f%u: attach %llu us of %llu (flush %llu, wait %llu, copy %llu, rest %lld)\n",
+		    e->frames, e->attaching, after - e->began, e->flushing, waited - before, after - waited,
+		    (long long)(after - e->began) - (long long)e->attaching - (long long)e->flushing -
+		    (long long)(waited - before) - (long long)(after - waited));
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
