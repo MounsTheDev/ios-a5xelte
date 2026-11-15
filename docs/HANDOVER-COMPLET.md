@@ -486,6 +486,24 @@ avant la première lecture. Le reste de la chaîne est validé.
 **Étape 1 terminée.** Le contrôleur est lu, les appuis sont journalisés,
 aucun geste n'est injecté.
 
+### Étape 2/4 — injection et rétroéclairage (patch `0349`)
+
+- **Gauche** (`rec=P`) : deux appuis Home à 80 ms d'écart (down, 40 ms, up,
+  40 ms, down, 40 ms, up) → multitâche iOS.
+- **Droite** (`back=P`) : swipe du numériseur virtuel, x 2 → 320 à y 667,
+  ~120 ms (down à 2, pas de 32 toutes les 12 ms, up à 320).
+- **LED** : `CMD_LED_ON` (`0x10`) écrit sur `BTNSTATUS` `0x00` à chaque
+  appui, `CMD_LED_OFF` (`0x20`) 3 s après le dernier.
+- **Front d'appui strict** : seuls les bits 0-3 sont suivis, et l'action
+  part sur la transition vers `2` (appui), jamais sur la relâche ni sur la
+  relecture qui suit la désassertion de l'IRQ. Garde de 300 ms par touche.
+- **ID** : 200 ms après la LDO, 3 essais par registre, cycle LDO off/on en
+  dernier recours.
+
+Image : `build/xnu-boot-tk3.img`, sha256
+`09d5231c9030468d535377b2366f3e0d93fa9bd70b1afe7b09a505e6d5fa2321`
+(build `xnu` 43727793429, 12 min 58 s). Test sur téléphone : à faire.
+
 ### Plan de travail recommandé
 
 1. **Étape 1 — lire, ne rien injecter.** I2C bit-bangé sur les deux broches,
