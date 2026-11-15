@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..6751e3c 100644
+index f08a35c..627ecb9 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -26,7 +26,28 @@ index f08a35c..6751e3c 100644
  #define HSI2C_CONF      0x40
  #define HSI2C_AUTO_CONF 0x44
  #define HSI2C_TIMEOUT   0x48
-@@ -164,6 +174,31 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+@@ -59,6 +69,20 @@ volatile int herolte_fg_dtls;           /* CHG_DETAILS_00 byte */
+ #define HSI2C_ADDR      0x70
+ 
+ static vm_offset_t fg_i2c, fg_pins;
++/*
++ * (0368) One HSI2C controller, two callers: the 200 ms power thread in
++ * herolte_gpu.c reads the charger for the plug edge, and SweetBattery's own
++ * timer reads the gauge and republishes.  bt7 showed what happens without
++ * this lock -- after the first unplug every transaction failed (the dump
++ * printed "00?" for all three sub-addresses) and SweetBattery fell back to a
++ * static 4200 mV, i.e. the controller was left mid-transfer by whoever lost
++ * the race and never recovered.  Static, because both callers can run before
++ * herolte_fg_init().
++ */
++static LCK_GRP_DECLARE(fg_grp, "herolte_battery");
++static LCK_MTX_DECLARE(fg_mtx_store, &fg_grp);
++#define fg_mtx (&fg_mtx_store)
++static void fg_bus_resync(void);
+ 
+ static uint32_t
+ fg_rd(vm_offset_t base, uint32_t off)
+@@ -164,6 +188,49 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
  	return fg_message_at(FG_ADDR, receive, bytes, count, stop);
  }
  
@@ -50,15 +71,45 @@ index f08a35c..6751e3c 100644
 +			*value = b;
 +			return true;
 +		}
-+		delay(500);
++		fg_bus_resync();
++		delay(2);
 +	}
 +	return false;
++}
++
++/*
++ * (0368) Put the controller back in a known state after a failed transfer.
++ * Samsung's HSI2C holds its state machine when a slave NAKs or times out, so
++ * the next start bit is ignored and every later read returns the FIFO's
++ * leftovers -- which is exactly the "00?" bt7 logged.  A control reset and a
++ * FIFO flush is what the vendor driver does on its error path.
++ */
++static void
++fg_bus_resync(void)
++{
++	fg_wr(fg_i2c, HSI2C_CTL, 0x80000009u);          /* reset the controller */
++	fg_wr(fg_i2c, HSI2C_CTL, 0x00000009u);
++	fg_wr(fg_i2c, HSI2C_TIMEOUT, 0);
++	fg_wr(fg_i2c, HSI2C_INT_EN, 0);
++	(void)fg_rd(fg_i2c, HSI2C_INT_STAT);
 +}
 +
  static bool
  fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
  {
-@@ -216,27 +251,254 @@ herolte_fg_init(void)
+@@ -174,7 +241,10 @@ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
+ 			*value = (uint16_t)(b[0] | (b[1] << 8));
+ 			return true;
+ 		}
+-		delay(500);
++		/* (0368) Bounded: 2 ms, not 500.  A dead bus must not stall the
++		 * power thread for seconds while it holds the lock. */
++		fg_bus_resync();
++		delay(2);
+ 	}
+ 	return false;
+ }
+@@ -216,30 +286,262 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -101,6 +152,7 @@ index f08a35c..6751e3c 100644
 -	 * latched charger interrupt; 0xB2 bit 6 is CHGIN_OK; 0xB3 bits 6:5 are
 -	 * CHGIN_DTLS (0 = no input).  Both must agree, so an unplug clears it.
 -	 */
++	lck_mtx_lock(fg_mtx);
  	herolte_fg_ac_valid = 0;
  	herolte_fg_ac = 0;
 -	if (fg_i2c) {
@@ -113,6 +165,7 @@ index f08a35c..6751e3c 100644
 -		herolte_fg_dtls = dtls & 0xff;
 -		herolte_fg_ac = chg_ok && (chg & 0x40) && (dtls_ok ? ((dtls & 0x60) != 0) : 1);
 +	if (!fg_i2c) {
++		lck_mtx_unlock(fg_mtx);
 +		return -1;
 +	}
 +	/*
@@ -156,14 +209,17 @@ index f08a35c..6751e3c 100644
 +	if (chgin || vbvolt || charging_now) {
 +		herolte_fg_ac_valid = 1;
 +		herolte_fg_ac = 1;
++		lck_mtx_unlock(fg_mtx);
 +		return 0;
 +	}
 +	if (chg_ok || st2_ok || cur_ok) {
 +		/* The blocks answered and none of them sees power: a real "out". */
 +		herolte_fg_ac_valid = 1;
 +		herolte_fg_ac = 0;
++		lck_mtx_unlock(fg_mtx);
 +		return 0;
 +	}
++	lck_mtx_unlock(fg_mtx);
 +	return -1;
 +}
 +
@@ -177,7 +233,7 @@ index f08a35c..6751e3c 100644
 +
 +	if (!fg_charger_current(&raw)) {
 +		return 0;
- 	}
++	}
 +	/* 0.25 mA per LSB, the MAX77854 fuel gauge's step. */
 +	return (int)((int32_t)raw / 4);
 +}
@@ -197,23 +253,21 @@ index f08a35c..6751e3c 100644
 +		    (unsigned)cur_raw, herolte_fg_current_mA(), 0);
 +	}
 +	printf("HEROLTE FG: ---- dump (%s) ----\n", why);
-+	for (unsigned i = 0; i < 8; i++) {
-+		uint8_t top = 0, chg = 0, muic = 0;
-+		bool t_ok = fg_byte_at(0x66, (uint8_t)(0xB0 + i), &top);
-+		bool c_ok = fg_byte_at(0x69, (uint8_t)(0xB0 + i), &chg);
-+		bool m_ok = fg_byte_at(0x25, (uint8_t)(0xB0 + i), &muic);
-+		printf("HEROLTE FG: 0x%02x top=%#02x%s chg=%#02x%s muic=%#02x%s\n",
-+		    0xB0 + i, top, t_ok ? "" : "?", chg, c_ok ? "" : "?",
-+		    muic, m_ok ? "" : "?");
++	/*
++	 * (0368) Four deciding bytes, not forty-one registers.  bt7 walked the
++	 * whole 0x66/0x69/0x25 window on every change and held the bus long
++	 * enough to stall the power thread.
++	 */
++	{
++		uint8_t t0 = 0, c2 = 0, c3 = 0, m2 = 0;
++		bool a = fg_byte_at(0x69, 0xB2, &c2);
++		bool b = fg_byte_at(0x69, 0xB3, &c3);
++		bool c = fg_byte_at(0x25, 0x02, &m2);
++		bool d = fg_byte_at(0x66, 0x00, &t0);
++		printf("HEROLTE FG: top_id=%#02x%s chg_ok=%#02x%s chg_dtls=%#02x%s muic2=%#02x%s\n",
++		    t0, d ? "" : "?", c2, a ? "" : "?", c3, b ? "" : "?", m2, c ? "" : "?");
 +	}
 +	/* The MUIC's own status bytes, where Samsung keeps vbvolt and chgtyp. */
-+	for (unsigned i = 0; i < 4; i++) {
-+		uint8_t v = 0;
-+		bool ok = fg_byte_at(0x25, (uint8_t)(0x01 + i), &v);
-+		printf("HEROLTE FG: 0x25:0x%02x = %#02x (%s)%s\n", 0x01 + i,
-+		    (unsigned)v, ok ? "answered" : "no answer",
-+		    (0x02 == 0x01 + i && (v & 0x02)) ? " vbvolt" : "");
-+	}
 +	printf("HEROLTE FG: ---- dump end ----\n");
 +}
 +
@@ -288,7 +342,7 @@ index f08a35c..6751e3c 100644
 +			printf("HEROLTE PMIC: etc0 con=%#x dat=%#x pud=%#x\n",
 +			    fg_rd(pins, 0x00), fg_rd(pins, 0x04), fg_rd(pins, 0x08));
 +		}
-+	}
+ 	}
 +}
 +
 +int
@@ -323,12 +377,25 @@ index f08a35c..6751e3c 100644
 +int
 +herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
 +{
-+	uint16_t soc, vcell, current, rem, full;
-+	/* (0355) Same live charger read as the fast poll; no latched B0 touch. */
++	/* (0355) Same live charger read as the fast poll; it takes the lock itself. */
 +	(void)herolte_fg_charger();
++	lck_mtx_lock(fg_mtx);
++	uint16_t soc, vcell, current, rem, full;
  	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_VCELL, &vcell) ||
  	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
  	    !fg_word(FG_FULLCAP, &full)) {
++		lck_mtx_unlock(fg_mtx);
+ 		return -1;
+ 	}
+ 	/* (0330) TEMP 0x08: signed, 1/256 degree (the MAX17047 family's; Linux in TWRP read 30.6 C from it) */
+@@ -257,6 +559,7 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	herolte_fg_ma = *ma;
+ 	*rem_mah = rem / 2u;
+ 	*full_mah = full / 2u;
++	lck_mtx_unlock(fg_mtx);
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
 index 5fe437a..4d350db 100644
 --- a/bsd/dev/herolte_gpu.c

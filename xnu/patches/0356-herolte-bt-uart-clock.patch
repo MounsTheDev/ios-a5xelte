@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..16a2050 100644
+index 26fefa3..e4b430a 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
 @@ -61,6 +61,41 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
@@ -44,7 +44,7 @@ index 26fefa3..16a2050 100644
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +148,165 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +148,170 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -169,7 +169,7 @@ index 26fefa3..16a2050 100644
 + * of range) is replaced.
 + */
 +static void
-+bt_uart_conf(void)
++bt_uart_conf(unsigned src, unsigned div, unsigned frac)
 +{
 +	uint32_t ulcon = bt_rd(bt_uart, UART_ULCON);
 +	uint32_t ucon = bt_rd(bt_uart, UART_UCON);
@@ -191,26 +191,31 @@ index 26fefa3..16a2050 100644
 +	 * receive-timeout bits the bootloader already had.  They are polled, but the
 +	 * block only shifts with the run bits set.
 +	 */
++	/*
++	 * (0369) Caller chooses the clock source and the divisor, because bt7
++	 * left one question open: with src=1 (SCLK_UART1, the PLL) ufstat stayed
++	 * 0, and a baud generator with no input clock shifts nothing at all --
++	 * every register looks healthy while not one bit leaves the pad.  Source
++	 * 0 is PCLK from PERIC0, which the UARTs are documented against on this
++	 * SoC, so both sources and both plausible PCLK rates are swept.
++	 */
 +	uint32_t want = (ucon & 0x100u) | 0x3c5u;
 +	if (ucon != 0xffffffffu) {
 +		want |= ucon & 0x3000u;                         /* keep its RX timeout */
-+		want |= ucon & (3u << 9);                       /* keep the clock source */
 +	}
-+	bt_wr(bt_uart, UART_UCON, want);
-+	if (ubrdiv == 0 || ubrdiv > 1000) {
-+		ubrdiv = 54;                                    /* 115200 from 100 MHz */
-+		ufrac = 4;
-+		bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
-+		bt_wr(bt_uart, UART_UFRACVAL, ufrac);
-+	}
-+	BT_LOG("HEROLTE BT: uart set ulcon=3 ucon=%#x ubrdiv=%u ufrac=%u",
-+	    bt_rd(bt_uart, UART_UCON), bt_rd(bt_uart, UART_UBRDIV), bt_rd(bt_uart, UART_UFRACVAL));
++	bt_wr(bt_uart, UART_UCON, (want & ~(3u << 9)) | ((src & 3u) << 9));
++	bt_wr(bt_uart, UART_UBRDIV, div);
++	bt_wr(bt_uart, UART_UFRACVAL, frac);
++	bt_uart_src = (bt_rd(bt_uart, UART_UCON) >> 9) & 3u;
++	BT_LOG("HEROLTE BT: uart set src=%u ucon=%#x ubrdiv=%u ufrac=%u",
++	    bt_uart_src, bt_rd(bt_uart, UART_UCON), bt_rd(bt_uart, UART_UBRDIV),
++	    bt_rd(bt_uart, UART_UFRACVAL));
 +}
 +
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +443,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +448,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -218,7 +223,7 @@ index 26fefa3..16a2050 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,39 +459,65 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,45 +464,90 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
@@ -289,10 +294,6 @@ index 26fefa3..16a2050 100644
 -	if (ubrdiv == 0 || ubrdiv > 1000) {
 -		ubrdiv = 53;                                    /* 115200 from 100 MHz */
 -		ufrac = 20;
--	}
--	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
--	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
--	bt_msleep(10);
 +	/*
 +	 * (0367) The UART is configured BEFORE the chip is asked anything, and
 +	 * HOST_WAKE is no longer a gate on sending.
@@ -307,12 +308,46 @@ index 26fefa3..16a2050 100644
 +	 * the chip, then talk: AFC and RTS asserted, 8N1 and the divisor set,
 +	 * 300 ms for the ROM, then HCI_Reset with no condition on HOST_WAKE.
 +	 */
-+	bt_uart_conf();
-+	bt_msleep(300);
-+	BT_LOG("HEROLTE BT: uart=0x%x reg_on=%d wake=%d host_wake=%d umcon=%#x ufstat=%#x",
-+	    BT_UART_PA, (int)((bt_rd(bt_peric1, 0x64) >> 7) & 1u),
-+	    (int)((bt_rd(bt_fsys0, 0x24) >> 3) & 1u), bt_host_wake(),
-+	    bt_rd(bt_uart, UART_UMCON), bt_rd(bt_uart, UART_UFSTAT));
- 	/* HCI_Reset, minidriver, .hcd, reset again. */
- 	rlen = sizeof(reply);
- 	bool reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
++	/*
++	 * (0369) Sweep the two clock sources and the two plausible PCLK rates,
++	 * sending HCI_Reset at each one and watching the receive FIFO.  bt7 had
++	 * every register healthy and ufstat=0, which is what a baud generator
++	 * with no clock looks like.  The first combination that puts a byte in
++	 * UFSTAT is the right one, and it is logged for good.
++	 */
++	static const struct {
++		unsigned src, div, frac;
++		const char *what;
++	} sweep[] = {
++		{ 1, 54, 4, "src=1 100MHz" },
++		{ 0, 54, 4, "src=0 pclk 100MHz" },
++		{ 0, 35, 3, "src=0 pclk 66MHz" },
++		{ 1, 35, 3, "src=1 66MHz" },
++	};
++	bool reset = false;
++	bool got = false;
++	for (unsigned i = 0; i < sizeof(sweep) / sizeof(sweep[0]) && !got; i++) {
++		bt_uart_conf(sweep[i].src, sweep[i].div, sweep[i].frac);
++		bt_msleep(300);
++		rlen = sizeof(reply);
++		reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
++		unsigned rx = bt_rd(bt_uart, UART_UFSTAT) & 0x7fu;
++		BT_LOG("HEROLTE BT: try %s reset=%d ufstat=%#x utrstat=%#x host_wake=%d",
++		    sweep[i].what, reset, rx, bt_rd(bt_uart, UART_UTRSTAT),
++		    bt_host_wake());
++		got = reset;
+ 	}
+-	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
+-	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
+-	bt_msleep(10);
+-	/* HCI_Reset, minidriver, .hcd, reset again. */
+-	rlen = sizeof(reply);
+-	bool reset = bt_hci_cmd(0x0c03, NULL, 0, reply, &rlen, 500);
+-	BT_LOG("HEROLTE BT: reset ok=%d", reset);
+-	if (!reset) {
+-		BT_LOG("HEROLTE BT: no HCI answer, stopping");
++	if (!got) {
++		BT_LOG("HEROLTE BT: no HCI answer on any clock, stopping");
+ 		return;
+ 	}
+ 	uint8_t dummy[8];
