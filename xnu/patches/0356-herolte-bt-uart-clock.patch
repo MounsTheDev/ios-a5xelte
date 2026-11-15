@@ -1,0 +1,205 @@
+diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
+index 26fefa3..18abe94 100644
+--- a/bsd/dev/herolte_bt.c
++++ b/bsd/dev/herolte_bt.c
+@@ -61,6 +61,26 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
+ static bool bt_started;
+ static int bt_sleep;
+ 
++/*
++ * (0356) The clock that was missing.  The bootloader never configured UART1:
++ * bt1 read it back as ulcon=0 ucon=0x3000 ubrdiv=0 ufrac=0, i.e. no line
++ * format and no divisor, so HCI_Reset went out over a UART that was not
++ * transmitting and the chip never answered.  ucon=0x3000 is only the two
++ * receive-timeout bits; the clock-selection field (bits 10:9) was zero, so
++ * the block was not even fed.  The CMU gates and the baud clock are therefore
++ * opened here before any divider is written, the way Linux's exynos8890 clock
++ * driver does for the UART:
++ *
++ *   0x10570000 PLL_1443X  (raw PLL registers: pll_con0 low, pll_con1 high)
++ *   0x14C80000 CMU_PERIC1  (CMU gate 0x800, source 0x400, divisor 0x500)
++ *
++ * Every write keeps the bits it does not own, and each interesting value is
++ * logged whether it was read or written, so one journal line tells the next
++ * session what was actually there.
++ */
++#define BT_CMU_PERI_PA   0x10570000u    /* raw PLL registers: PLL1416X/PLL1443X */
++#define BT_CMU_PERIC1_PA 0x14C80000u    /* UART1 gate, clock source, divider */
++
+ static uint32_t
+ bt_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -113,6 +133,112 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+ 	bt_wr(base, dat, v);
+ }
+ 
++/* (0356) BT_HOST_WAKE (GPA2-3, ALIVE 0x10580000 +0x40): 0 while the chip holds it down. */
++static int
++bt_host_wake(void)
++{
++	return (int)((bt_rd(bt_alive, 0x44) >> 3) & 1u);
++}
++
++/*
++ * (0356) Wait for BT_HOST_WAKE to come back high after reset, instead of a
++ * fixed sleep: the BCM4359 drives it low while it boots and releases it when
++ * the HCI layer is up.  Returns the milliseconds spent, or the negation of the
++ * timeout when it never freed the line.
++ */
++static int
++bt_wait_host_wake(unsigned timeout_ms)
++{
++	for (unsigned ms = 0; ms < timeout_ms; ms++) {
++		if (bt_host_wake()) {
++			return (int)ms;
++		}
++		bt_msleep(1);
++	}
++	return -(int)timeout_ms;
++}
++
++/*
++ * (0356) Open the UART's clock: the CMU gate, a clock source, a divisor, then
++ * the block's own clock-select.  Nothing here depends on a previous state, so
++ * a cold run after the bootloader (which left everything at zero) works as
++ * well as a warm one from a driver that already powered the block.
++ */
++static uint32_t bt_cmu_gate, bt_cmu_src, bt_cmu_div, bt_pll_con0, bt_pll_con1;
++
++static void
++bt_uart_clock(void)
++{
++	vm_offset_t peri = ml_io_map(BT_CMU_PERI_PA, 0x1000);
++	vm_offset_t cmu = ml_io_map(BT_CMU_PERIC1_PA, 0x1000);
++	if (!peri || !cmu) {
++		BT_LOG("HEROLTE BT: CMU mapping failed");
++		return;
++	}
++	bt_pll_con0 = bt_rd(peri, 0x000);
++	bt_pll_con1 = bt_rd(peri, 0x004);
++	bt_cmu_gate = bt_rd(cmu, 0x800);
++	bt_cmu_src = bt_rd(cmu, 0x400);
++	bt_cmu_div = bt_rd(cmu, 0x500);
++	unsigned locked = (unsigned)((bt_pll_con1 >> 21) & 1u);
++	unsigned mux = (unsigned)(bt_cmu_src & 0x3u);
++	/* Clock source 1 (the PLL) when the PLL is locked, else the oscillator. */
++	unsigned want_mux = locked ? 1u : 0u;
++	if (mux != want_mux) {
++		bt_wr(cmu, 0x400, (bt_cmu_src & ~0x3u) | want_mux);
++	}
++	/* Divisor 1: UART1 divides its source by 1 and the UART does the rest. */
++	if ((bt_cmu_div & 0xfu) != 1u) {
++		bt_wr(cmu, 0x500, (bt_cmu_div & ~0xfu) | 1u);
++	}
++	/* Gate 5 and its child bus gate 4 drive UART1 on PERIC1. */
++	if ((bt_cmu_gate & 0x30u) != 0x30u) {
++		bt_wr(cmu, 0x800, bt_rd(cmu, 0x800) | 0x30u);
++	}
++	BT_LOG("HEROLTE BT: cmu pll=%#x/%#x locked=%u gate=%#x src=%#x(->%u) div=%#x(->1)",
++	    bt_pll_con0, bt_pll_con1, locked, bt_cmu_gate, bt_cmu_src, want_mux, bt_cmu_div);
++}
++
++/*
++ * (0356) 8N1 from a known clock.  The bootloader left ulcon=0, ubrdiv=0 and
++ * ufrac=0, so both quotients are computed, not trusted: 100 MHz / (16 x
++ * 115200) = 54.25, i.e. 54 with a fractional part of 0.25 x 16 = 4.  A
++ * plausible value left by a warm boot is kept; anything else (0, all ones, out
++ * of range) is replaced.
++ */
++static void
++bt_uart_conf(void)
++{
++	uint32_t ulcon = bt_rd(bt_uart, UART_ULCON);
++	uint32_t ucon = bt_rd(bt_uart, UART_UCON);
++	uint32_t ubrdiv = bt_rd(bt_uart, UART_UBRDIV);
++	uint32_t ufrac = bt_rd(bt_uart, UART_UFRACVAL);
++	BT_LOG("HEROLTE BT: uart as found ulcon=%#x ucon=%#x ufcon=%#x umcon=%#x ubrdiv=%u ufrac=%u",
++	    ulcon, ucon, bt_rd(bt_uart, UART_UFCON), bt_rd(bt_uart, UART_UMCON), ubrdiv, ufrac);
++	bt_wr(bt_uart, UART_ULCON, 0x3);                        /* 8N1, one stop, no parity */
++	bt_wr(bt_uart, UART_UFCON, 0x7);                        /* reset both FIFOs */
++	bt_wr(bt_uart, UART_UFCON, 0x111);                      /* FIFO, 4/4 trigger */
++	bt_wr(bt_uart, UART_UMCON, 0x1);                        /* AFC/RTS */
++	/*
++	 * Clock select on the PCLK, transmitter and receiver running, and the
++	 * receive-timeout bits the bootloader already had.  They are polled, but the
++	 * block only shifts with the run bits set.
++	 */
++	uint32_t want = (ucon & 0x100u) | 0x3c5u;
++	if (ucon != 0xffffffffu) {
++		want |= ucon & 0x3000u;                         /* keep its RX timeout */
++	}
++	bt_wr(bt_uart, UART_UCON, want);
++	if (ubrdiv == 0 || ubrdiv > 1000) {
++		ubrdiv = 54;                                    /* 115200 from 100 MHz */
++		ufrac = 4;
++		bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
++		bt_wr(bt_uart, UART_UFRACVAL, ufrac);
++	}
++	BT_LOG("HEROLTE BT: uart set ulcon=3 ucon=%#x ubrdiv=%u ufrac=%u",
++	    bt_rd(bt_uart, UART_UCON), bt_rd(bt_uart, UART_UBRDIV), bt_rd(bt_uart, UART_UFRACVAL));
++}
++
+ static bool
+ bt_tx_byte(uint8_t b)
+ {
+@@ -249,7 +375,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint8_t reply[64];
+ 	uint8_t rlen;
+-	uint32_t ulcon, ucon, ufcon, umcon, ubrdiv, ufrac;
+ 	unsigned events = 0;
+ 
+ 	/* The rootfs and the drop zone are up by then. */
+@@ -266,38 +391,25 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+ 	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
+ 	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
+ 	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
+-	/* BT_REG_ON low, BT_WAKE high, BT_REG_ON high, 150 ms. */
++	/* (0356) The block's own clock, before anything is written to it. */
++	bt_uart_clock();
++	/* BT_REG_ON low, BT_WAKE high, pause, BT_REG_ON high. */
+ 	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
+ 	bt_msleep(20);
+ 	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
+ 	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
+-	bt_msleep(150);
++	/*
++	 * (0356) Wait for the chip's own sign of life instead of a fixed sleep:
++	 * BT_HOST_WAKE is driven low while it boots.  In bt1 the line read 0 just
++	 * after the 150 ms sleep and the HCI_Reset was sent anyway; here the wait
++	 * is bounded and the outcome is logged either way.
++	 */
+ 	bt_pin_fn(bt_alive, 0x40, 3, 0);                        /* host wake, input */
+-	BT_LOG("HEROLTE BT: uart=0x%x reg_on=1 wake=1 host_wake=%d",
+-	    BT_UART_PA, (int)((bt_rd(bt_alive, 0x44) >> 3) & 1u));
+-	/* What the bootloader left, then 8N1 with RTS/CTS. */
+-	ulcon = bt_rd(bt_uart, UART_ULCON);
+-	ucon = bt_rd(bt_uart, UART_UCON);
+-	ufcon = bt_rd(bt_uart, UART_UFCON);
+-	umcon = bt_rd(bt_uart, UART_UMCON);
+-	ubrdiv = bt_rd(bt_uart, UART_UBRDIV);
+-	ufrac = bt_rd(bt_uart, UART_UFRACVAL);
+-	BT_LOG("HEROLTE BT: uart as found ulcon=%#x ucon=%#x ufcon=%#x umcon=%#x ubrdiv=%u ufrac=%u",
+-	    ulcon, ucon, ufcon, umcon, ubrdiv, ufrac);
+-	bt_wr(bt_uart, UART_ULCON, 0x3);
+-	bt_wr(bt_uart, UART_UFCON, 0x7);                        /* reset both FIFOs */
+-	bt_wr(bt_uart, UART_UFCON, 0x111);                      /* FIFO, 4/4 trigger */
+-	bt_wr(bt_uart, UART_UMCON, 0x1);                        /* AFC/RTS */
+-	if (ucon == 0 || ucon == 0xffffffffu) {
+-		ucon = 0x3c5;
+-	}
+-	bt_wr(bt_uart, UART_UCON, ucon);
+-	if (ubrdiv == 0 || ubrdiv > 1000) {
+-		ubrdiv = 53;                                    /* 115200 from 100 MHz */
+-		ufrac = 20;
+-	}
+-	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
+-	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
++	int woke = bt_wait_host_wake(1500);
++	BT_LOG("HEROLTE BT: uart=0x%x reg_on=1 wake=1 host_wake=%d waited=%d ms",
++	    BT_UART_PA, bt_host_wake(), woke);
++	/* (0356) 8N1 115200 from a known clock. */
++	bt_uart_conf();
+ 	bt_msleep(10);
+ 	/* HCI_Reset, minidriver, .hcd, reset again. */
+ 	rlen = sizeof(reply);

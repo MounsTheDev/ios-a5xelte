@@ -1,0 +1,239 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index f08a35c..ec5c521 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -18,6 +18,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
++int herolte_fg_charger(void);
+ 
+ #define FG_HSI2C_PA     0x13650000u
+ #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
+@@ -216,27 +217,42 @@ herolte_fg_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * (0355) The charger alone, two reads, for the fast poll that owns the plug
++ * icon.  The MAX77854 keeps the cable's state in its *status* bytes, B2 bit 6
++ * CHGIN_OK and B3 bits 6:5 CHGIN_DTLS, which follow the input live: only their
++ * copies in the latched interrupt register B0 (CHGIN_I, bits 6 and 5:4) hold
++ * the last edge until it is read, so the status alone never sticks at 1 after
++ * an unplug.  Reading B0 here would be wrong in the other direction: clearing
++ * it every 500 ms would discard the edge the charger driver wants.
++ *
++ * Returns 0 when both reads answered, -1 otherwise; either way the published
++ * state is the one just read, and a failed read means "no cable".
++ */
+ int
+-herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
++herolte_fg_charger(void)
+ {
+-	uint16_t soc, vcell, current, rem, full;
+-	/*
+-	 * Charger first, live, even if the gauge read fails.  0xB0 clears the
+-	 * latched charger interrupt; 0xB2 bit 6 is CHGIN_OK; 0xB3 bits 6:5 are
+-	 * CHGIN_DTLS (0 = no input).  Both must agree, so an unplug clears it.
+-	 */
+ 	herolte_fg_ac_valid = 0;
+ 	herolte_fg_ac = 0;
+-	if (fg_i2c) {
+-		uint16_t chg = 0, dtls = 0, intreg = 0;
+-		(void)fg_word_at(0x66, 0xB0, &intreg);
+-		bool chg_ok = fg_word_at(0x66, 0xB2, &chg);
+-		bool dtls_ok = fg_word_at(0x66, 0xB3, &dtls);
+-		herolte_fg_ac_valid = chg_ok;
+-		herolte_fg_ac_raw = chg & 0xff;
+-		herolte_fg_dtls = dtls & 0xff;
+-		herolte_fg_ac = chg_ok && (chg & 0x40) && (dtls_ok ? ((dtls & 0x60) != 0) : 1);
++	if (!fg_i2c) {
++		return -1;
+ 	}
++	uint16_t chg = 0, dtls = 0;
++	bool chg_ok = fg_word_at(0x66, 0xB2, &chg);
++	bool dtls_ok = fg_word_at(0x66, 0xB3, &dtls);
++	herolte_fg_ac_valid = chg_ok;
++	herolte_fg_ac_raw = chg & 0xff;
++	herolte_fg_dtls = dtls & 0xff;
++	herolte_fg_ac = chg_ok && (chg & 0x40) && (dtls_ok ? ((dtls & 0x60) != 0) : 1);
++	return (chg_ok && dtls_ok) ? 0 : -1;
++}
++
++int
++herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
++{
++	uint16_t soc, vcell, current, rem, full;
++	/* (0355) Same live charger read as the fast poll; no latched B0 touch. */
++	(void)herolte_fg_charger();
+ 	if (!fg_i2c || !fg_word(FG_REPSOC, &soc) || !fg_word(FG_VCELL, &vcell) ||
+ 	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
+ 	    !fg_word(FG_FULLCAP, &full)) {
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 5fe437a..165c9d4 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -30,6 +30,8 @@ extern volatile int herolte_fg_ac;       /* MAX77854 CHGIN_OK */
+ extern volatile int herolte_fg_ac_valid;
+ extern volatile int herolte_fg_ac_raw;
+ extern volatile int herolte_fg_dtls;
++/* (0355) Two register reads on the charger MFD, for the plug-edge wake-up. */
++extern int herolte_fg_charger(void);
+ void herolte_gpu_probe(void);
+ /* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp. */
+ int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+@@ -72,6 +74,17 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ static int hg_sleep;
+ static int hg_pwr_sleep;
+ 
++/*
++ * (0355) Wake hg_power_thread now instead of on its next 200 ms tick: the
++ * panel's power change uses it, and so does the charger edge, which arrives on
++ * the charger's own clock.  Same channel as hg_pwr_msleep's wait.
++ */
++void
++herolte_power_wake(void)
++{
++	thread_wakeup((event_t)&hg_pwr_sleep);
++}
++
+ static uint32_t
+ hg_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -2617,6 +2630,24 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 		unsigned mv = herolte_fg_mv;
+ 		/* Live charger state: no latch, battery on any failed read. */
+ 		bool ac = herolte_fg_ac_valid && herolte_fg_ac != 0;
++		/*
++		 * (0355) This loop is the real-clock hook of the charger: 200 ms is the
++		 * fastest tick the kernel offers without interrupts, so the cable's edge
++		 * is read here rather than waited for in SweetBattery's 500 ms poll.  The
++		 * read keeps the gauge sample (mv, ma, %) in the same instant as the
++		 * state it is published with, and a transition wakes the userland poll so
++		 * the status bar follows the cable in about one tick.
++		 */
++		bool was_ac = ac;
++		if (herolte_fg_charger() == 0) {
++			ac = herolte_fg_ac != 0;
++		}
++		if (ac != was_ac) {
++			herolte_power_wake();
++			printf("HEROLTE PWR: plug=%d (%s) ac_raw=%#x dtls=%#x vbat=%umV\n",
++			    ac ? 1 : 0, ac ? "in" : "out",
++			    (unsigned)herolte_fg_ac_raw, (unsigned)herolte_fg_dtls, mv);
++		}
+ 		if (mv != 0 && mv != last_mv) {
+ 			/* The gauge updates about once a second; five distinct samples. */
+ 			vbat_hist[vbat_n++ % 5] = mv;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 92b6a8d..a5a4466 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,8 +17,12 @@
+ extern "C" int herolte_fg_init(void);
+ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
++/* (0355) The charger alone: CHGIN_OK 0xB2 bit 6, CHGIN_DTLS 0xB3 bits 6:5. */
++extern "C" int herolte_fg_charger(void);
+ extern "C" volatile int herolte_fg_ac;          /* MAX77854 CHGIN_OK */
+ extern "C" volatile int herolte_fg_ac_valid;
++extern "C" volatile int herolte_fg_ac_raw;      /* CHG_INT_OK byte, for the log */
++extern "C" volatile int herolte_fg_dtls;        /* CHG_DETAILS_00 byte */
+ #define BATTERY_DESIGN_MAH 3000u        /* SM-G930F EB-BG930ABE */
+ #else
+ /* bsd/dev/sweet_spmi.c */
+@@ -39,11 +43,15 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	/* (0355) The last published charger state, for the plug-edge detection. */
++	bool fExternal;
++	bool fPublished;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	void chargerPoll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -83,6 +91,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	/* (0355) Nothing published yet: the first charger poll publishes. */
++	fExternal = false;
++	fPublished = false;
+ 	return true;
+ }
+ 
+@@ -221,6 +232,31 @@ SweetBattery::estimatePercent(unsigned mv)
+ #endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * (0355) The plug icon's own clock.  poll() costs fourteen HSI2C reads (three
++ * tries each) and must not run four times a second, so the fast timer reads
++ * only the charger's two status bytes.  When they agree with what was
++ * published, nothing happens; when they do not, the whole source is
++ * republished at once, so setExternalConnected(false) and setIsCharging(false)
++ * reach powerd in the same tick the cable left, with no 30 s wait.
++ *
++ * A failed read counts as "no cable": an icon that disappears a moment early
++ * is better than a lightning bolt that stays after the user pulled the plug.
++ */
++void
++SweetBattery::chargerPoll(void)
++{
++	bool ok = herolte_fg_charger() == 0;
++	bool ac = ok && herolte_fg_ac != 0;
++	if (fPublished && ac == fExternal) {
++		return;
++	}
++	IOLog("SWEET BATTERY: plug %s ac_raw=%#x dtls=%#x (%s)\n",
++	    ac ? "in" : "out", (unsigned)herolte_fg_ac_raw,
++	    (unsigned)herolte_fg_dtls, ok ? "read" : "read failed");
++	poll();
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+@@ -229,6 +265,8 @@ SweetBattery::poll(void)
+ 	int ret = fReal ? herolte_fg_read(&percent, &mv, &ma, &rem, &full) : -1;
+ 	/* Live charger state: no latch, false on any failed read. */
+ 	bool ac = herolte_fg_ac_valid ? (herolte_fg_ac != 0) : false;
++	fExternal = ac;
++	fPublished = true;
+ 	/* Zero, floating or implausible data cannot become 0% battery. */
+ 	if (!fReal || ret != 0 || mv < 2800 || mv > 4600) {
+ 		publish(100, 4200, 0, ac, ac, ac, true, false, false);
+@@ -291,8 +329,14 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* (0355) Two charger reads every 500 ms; the gauge itself every 30 s. */
++		self->chargerPoll();
++		sender->setTimeoutMS(500);
++#else
+ 		self->poll();
+ 		sender->setTimeoutMS(30000);
++#endif
+ 	}
+ }
+ 
+@@ -318,7 +362,12 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
++			/* (0355) HEROLTE: the fast charger tick first, then every 500 ms. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++			fTimer->setTimeoutMS(500);
++#else
+ 			fTimer->setTimeoutMS(30000);
++#endif
+ 		} else {
+ 			fReal = false;
+ 			poll();
