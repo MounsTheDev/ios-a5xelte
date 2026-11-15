@@ -757,5 +757,26 @@ GPU 338/650) + pwr2 (plafonds batterie, anti-UVLO, jauge lissée), image
 
 ---
 
+## 20. Correctif multitâche fantôme et charge (patch `0352`)
+
+- **Multitâche fantôme** : le MC96FT16xx renvoie parfois `0x82` (appui
+  récent + bit 7) après la commande LED ; le pilote y voyait un appui et
+  injectait le double Home. Il exige maintenant **deux échantillons propres
+  identiques** à 20 ms (nibble haut à 0), un échantillon sale remet le
+  compteur à zéro, et la garde passe à 500 ms.
+- **Charge non détectée** : `SweetBattery` ne regardait que `ma > 20`, donc
+  un chargeur faible (courant net faible) paraissait débranché. Le pilote
+  batterie lit maintenant le MFD MAX77854 à `0x66` sur le même HSI2C1 :
+  `CHG_INT_OK` (`0xB2`), bit 6 `CHGIN_OK`. `SweetBattery` publie
+  `external`/`charging` depuis ce bit et le thread de puissance l'utilise
+  pour les plafonds ; repli sur `ma` si la lecture échoue.
+- **Log** : `HEROLTE PWR: src=ac|bat ac_raw=0x.. cap_cpu=… cap_gpu=…
+  vbat=…mV`.
+- **Image** : `build/xnu-boot-fix1.img`, sha256
+  `c67cfdfb2f9acf368818927abe0dedb5aba5164a994f83bfff206d0db195b941`
+  (build 43739381894, 10 min 35 s, 0 fallos).
+
+---
+
 *Fin du document. Il est délibérément exhaustif : son but est qu'aucune des
 vingt heures de mesure de cette session ne soit à refaire.*
