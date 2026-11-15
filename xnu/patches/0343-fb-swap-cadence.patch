@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7282602..2421880 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -137,6 +137,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint32_t            fGaps[4];       /* frames shown 1, 2, 3, 4 to 30 ticks after the one before: what judder is */
+ 	uint32_t            fSwaps;         /* frames the window server gave, in this log window */
+ 	uint32_t            fOverwritten;   /* ... of them replaced before they were shown */
++	uint32_t            fSwapGap[4];    /* intervals between swaps: <12 ms, 12-20, 20-40, >40 (the real cadence) */
++	uint64_t            fLastSwapTime;  /* mach time of the last swap, 0 before the first */
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void showFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -602,13 +604,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		absolutetime_to_nanoseconds(finished - fb->fPerfWindowStart, &elapsedNS);
+ 		if (fb->fPerfFrames != 0 && elapsedNS != 0) {
+ 			uint64_t fpsTenths = fb->fPerfFrames * 10000000000ULL / elapsedNS;
+-			IOLog("A5XELTE FB: frames=%llu elapsed_ms=%llu fps=%llu.%llu bytes=%llu avg_copy_us=%llu max_copy_us=%llu missed=%llu gaps=%u/%u/%u/%u swaps=%u overwritten=%u vbl=%u\n",
++			IOLog("A5XELTE FB: frames=%llu elapsed_ms=%llu fps=%llu.%llu bytes=%llu avg_copy_us=%llu max_copy_us=%llu missed=%llu gaps=%u/%u/%u/%u swaps=%u overwritten=%u swapgap=%u/%u/%u/%u vbl=%u\n",
+ 			    fb->fPerfFrames, elapsedNS / 1000000, fpsTenths / 10,
+ 			    fpsTenths % 10, fb->fPerfBytes,
+ 			    fb->fPerfNS / fb->fPerfFrames / 1000, fb->fPerfMaxNS / 1000, fb->fVsyncMissed,
+-			    fb->fGaps[0], fb->fGaps[1], fb->fGaps[2], fb->fGaps[3], fb->fSwaps, fb->fOverwritten, fb->fVblSent);
++			    fb->fGaps[0], fb->fGaps[1], fb->fGaps[2], fb->fGaps[3], fb->fSwaps, fb->fOverwritten,
++			    fb->fSwapGap[0], fb->fSwapGap[1], fb->fSwapGap[2], fb->fSwapGap[3], fb->fVblSent);
+ 		}
+ 		bzero(fb->fGaps, sizeof(fb->fGaps));
++		bzero(fb->fSwapGap, sizeof(fb->fSwapGap));
+ 		fb->fSwaps = fb->fOverwritten = fb->fVblSent = 0;
+ 		fb->fPerfFrames = fb->fPerfBytes = fb->fPerfNS = fb->fPerfMaxNS = 0;
+ 		fb->fPerfWindowStart = finished;
+@@ -770,6 +774,21 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fSwaps++;
+ 	fOverwritten += fDirty ? 1 : 0;
++	/*
++	 * (perf) The fps in the log window counts present() calls, and the vsync timer presents the same picture again and
++	 * again while nothing changes, so it says more about the timer than about the cadence. The interval between two
++	 * swaps is the cadence the window server really holds: under 12 ms it is faster than 60 Hz, 12-20 is 60, 20-40 is
++	 * 30, and over 40 is an idle screen.
++	 */
++	{
++		uint64_t swapNow = mach_absolute_time();
++		if (fLastSwapTime != 0) {
++			uint64_t gapNS = 0;
++			absolutetime_to_nanoseconds(swapNow - fLastSwapTime, &gapNS);
++			fSwapGap[gapNS < 12000000 ? 0 : gapNS < 20000000 ? 1 : gapNS < 40000000 ? 2 : 3]++;
++		}
++		fLastSwapTime = swapNow;
++	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if (fShow != NULL) {
