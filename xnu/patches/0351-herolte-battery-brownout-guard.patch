@@ -1,0 +1,340 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 85319c9..6d8638a 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -23,6 +23,9 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* bsd/dev/herolte_battery.c: last fuel-gauge sample, updated by SweetBattery's poll. */
++extern volatile unsigned herolte_fg_mv;
++extern volatile int herolte_fg_ma;
+ void herolte_gpu_probe(void);
+ /* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp. */
+ int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
+@@ -434,6 +437,7 @@ hg_clock_report(void)
+ }
+ 
+ static uint32_t hg_gpu_mhz_now;
++static uint32_t hg_gpu_cap = 650;      /* 650 on AC, 546 on battery, 419 when low */
+ 
+ /*
+  * This phone's own table, as its Samsung kernel prints it (asv_table, G3D
+@@ -568,7 +572,7 @@ void
+ herolte_panel_power(bool on)
+ {
+ 	if (on) {
+-		(void)hg_gpu_rate(650);
++		(void)hg_gpu_rate(hg_gpu_cap);
+ 		/* hg_power_thread raises Mongoose now, not on its next 200 ms tick. */
+ 		thread_wakeup((event_t)&hg_pwr_sleep);
+ 		hg_dcs_short(0x11);     /* exit sleep */
+@@ -2301,11 +2305,21 @@ static const struct {
+  * and the raised rate: with the screen off or the battery hot the cores go back to exactly the bootloader's numbers
+  * (hc_go_low), and up again to herocpu_mhz (hc_go_high). Only the power thread (hg_power_thread) moves them after boot.
+  */
++/* ECT, this phone: rate, MNGS_PLL M (P 3, S 0), vdd_mngs register = (mV - 300) / 6.25, DIV_SCLK_PROMISE */
++static const struct {
++	uint32_t mhz, m;
++	uint8_t volt, promise;
++} hc_rates[] = {
++	{ 1976, 228, 0x62, 5 }, /* 912.5 mV */
++	{ 2288, 264, 0x6f, 6 }, /* 993.75 mV, Samsung's boot rate */
++	{ 2600, 300, 0x7c, 7 }, /* 1075 mV */
++};
++
+ static struct {
+ 	bool saved, high, broken;
+ 	uint32_t boot_pll, boot_div[HC_NDIVS], boot_ema, boot_assist;
+ 	uint8_t boot_volt;
+-	uint32_t mhz, m;
++	uint32_t mhz, m, rate_mhz;
+ 	uint8_t volt, promise;
+ 	vm_offset_t top, mngs, sysreg;
+ } hc;
+@@ -2344,42 +2358,88 @@ hc_relock(uint32_t bits)
+ 	return false;
+ }
+ 
+-/* Voltage first (read back), then EMA, dividers, the switch, the PLL at the raised rate, back to it. */
++/*
++ * A rate from hc_rates[], in the safe order.  Up: voltage (read back), EMA,
++ * dividers, the switch, the PLL.  Down: the switch, the PLL, the dividers,
++ * EMA, then the voltage.  hc_go_low() keeps the bootloader's exact state.
++ */
+ static bool
+-hc_go_high(void)
++hc_go_rate(uint32_t mhz)
+ {
+ 	extern bool herolte_apm_mngs_voltage(uint8_t value);
+-	uint8_t now = 0, set = 0;
+-	if (!herolte_apm_pmic_read(0x1d, &now)) {
++	uint32_t m = 0;
++	uint8_t volt = 0, promise = 0, now = 0, set = 0;
++
++	if (mhz == hc.rate_mhz) {
++		return true;
++	}
++	for (unsigned i = 0; i < sizeof(hc_rates) / sizeof(hc_rates[0]); i++) {
++		if (hc_rates[i].mhz == mhz) {
++			m = hc_rates[i].m;
++			volt = hc_rates[i].volt;
++			promise = hc_rates[i].promise;
++		}
++	}
++	if (!m || !herolte_apm_pmic_read(0x1d, &now)) {
+ 		return false;
+ 	}
+-	if (now < hc.volt) {
+-		bool wrote = herolte_apm_mngs_voltage(hc.volt);
++	bool up = mhz > hc.rate_mhz;
++	if (up && now < volt) {
++		bool wrote = herolte_apm_mngs_voltage(volt);
+ 		delay(200);
+-		if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != hc.volt) {
+-			printf("HEROLTE CPU: vdd_mngs %#x -> %#x failed (now %#x), left alone\n", now, hc.volt, set);
++		if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != volt) {
++			printf("HEROLTE CPU: vdd_mngs %#x -> %#x failed (now %#x), %u MHz not set\n", now, volt, set, mhz);
+ 			return false;
+ 		}
+ 	}
+-	hg_wr(hc.sysreg, 0x314, 0x001091b9);    /* MNGS_EMA_CON for 900 mV and more */
+-	hg_wr(hc.sysreg, 0x1040, 0);            /* MNGS_ASSIST_CON */
+-	for (unsigned i = 0; i < HC_NDIVS; i++) {
+-		uint32_t mask = (1u << hc_divs[i].bits) - 1;
+-		hg_wr(hc.mngs, hc_divs[i].off, (hg_rd(hc.mngs, hc_divs[i].off) & ~mask) |
+-		    (hc_divs[i].off == 0x430 ? hc.promise : hc_divs[i].ratio));
+-		delay(20);
++	if (up) {
++		hg_wr(hc.sysreg, 0x314, 0x001091b9);    /* MNGS_EMA_CON for 900 mV and more */
++		hg_wr(hc.sysreg, 0x1040, 0);            /* MNGS_ASSIST_CON */
++		for (unsigned i = 0; i < HC_NDIVS; i++) {
++			uint32_t mask = (1u << hc_divs[i].bits) - 1;
++			hg_wr(hc.mngs, hc_divs[i].off, (hg_rd(hc.mngs, hc_divs[i].off) & ~mask) |
++			    (hc_divs[i].off == 0x430 ? promise : hc_divs[i].ratio));
++			delay(20);
++		}
+ 	}
+ 	hc_to_switch();
+-	if (!hc_relock((hc.m << 16) | (3u << 8) | (1u << 5))) {
+-		printf("HEROLTE CPU: MNGS_PLL did not lock (%#x): the cores stay on the switch\n", hg_rd(hc.mngs, 0x100));
++	if (!hc_relock((m << 16) | (3u << 8) | (1u << 5))) {
++		printf("HEROLTE CPU: MNGS_PLL did not lock at %u MHz (%#x)\n", mhz, hg_rd(hc.mngs, 0x100));
+ 		hc.broken = true;
+ 		return false;
+ 	}
++	if (!up) {
++		for (unsigned i = 0; i < HC_NDIVS; i++) {
++			uint32_t mask = (1u << hc_divs[i].bits) - 1;
++			hg_wr(hc.mngs, hc_divs[i].off, (hg_rd(hc.mngs, hc_divs[i].off) & ~mask) |
++			    (hc_divs[i].off == 0x430 ? promise : hc_divs[i].ratio));
++			delay(20);
++		}
++	}
+ 	hc_from_switch();
+-	hc.high = true;
++	if (!up) {
++		hg_wr(hc.sysreg, 0x314, 0x001091b9);
++		hg_wr(hc.sysreg, 0x1040, 0);
++		if (now > volt) {
++			bool wrote = herolte_apm_mngs_voltage(volt);
++			delay(200);
++			if (!wrote || !herolte_apm_pmic_read(0x1d, &set) || set != volt) {
++				printf("HEROLTE CPU: vdd_mngs down %#x -> %#x failed (now %#x)\n", now, volt, set);
++			}
++		}
++	}
++	hc.rate_mhz = mhz;
++	hc.high = (mhz == hc.mhz);
++	printf("HEROLTE CPU: Mongoose %u MHz (vdd_mngs %#x)\n", mhz, volt);
+ 	return true;
+ }
+ 
++static bool
++hc_go_high(void)
++{
++	return hc_go_rate(hc.mhz);
++}
++
+ /* Down to the bootloader's numbers: the switch, the PLL relocked as it was, its dividers, back to it, EMA, then the voltage. */
+ static bool
+ hc_go_low(void)
+@@ -2400,6 +2460,7 @@ hc_go_low(void)
+ 	}
+ 	hc_from_switch();
+ 	hc.high = false;
++	hc.rate_mhz = 0;
+ 	hg_wr(hc.sysreg, 0x314, hc.boot_ema);
+ 	hg_wr(hc.sysreg, 0x1040, hc.boot_assist);
+ 	uint8_t set = 0;
+@@ -2414,15 +2475,7 @@ hc_go_low(void)
+ static void
+ hg_cpu_up(void)
+ {
+-	/* ECT, this phone: rate, MNGS_PLL M (P 3, S 0), vdd_mngs register = (mV - 300) / 6.25, DIV_SCLK_PROMISE */
+-	static const struct {
+-		uint32_t mhz, m;
+-		uint8_t volt, promise;
+-	} rates[] = {
+-		{ 1976, 228, 0x62, 5 }, /* 912.5 mV */
+-		{ 2288, 264, 0x6f, 6 }, /* 993.75 mV, Samsung's boot rate */
+-		{ 2600, 300, 0x7c, 7 }, /* 1075 mV */
+-	};
++	/* hc_rates[], shared with hc_go_rate(). */
+ 	static bool done;
+ 	uint32_t mhz = 0, target_m = 0;
+ 	uint8_t now = 0, set = 0, volt = 0, promise = 0;
+@@ -2430,11 +2483,11 @@ hg_cpu_up(void)
+ 	if (done || !PE_parse_boot_argn("herocpu_mhz", &mhz, sizeof(mhz))) {
+ 		return;
+ 	}
+-	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+-		if (rates[i].mhz == mhz) {
+-			target_m = rates[i].m;
+-			volt = rates[i].volt;
+-			promise = rates[i].promise;
++	for (unsigned i = 0; i < sizeof(hc_rates) / sizeof(hc_rates[0]); i++) {
++		if (hc_rates[i].mhz == mhz) {
++			target_m = hc_rates[i].m;
++			volt = hc_rates[i].volt;
++			promise = hc_rates[i].promise;
+ 		}
+ 	}
+ 	if (!target_m) {
+@@ -2479,9 +2532,10 @@ hg_cpu_up(void)
+ }
+ 
+ /*
+- * (0330) Sleep and heat. With the screen off (Power, SweetFramebuffer.cpp) for 3 s, or the battery at herohot degrees
+- * (42 by default; the MAX77854's TEMP, herolte_battery.c), the Mongoose cluster goes back to the bootloader's rate and
+- * voltage; with the screen on and the battery 3 degrees cooler, up to herocpu_mhz again. The A53s are left as they are.
++ * (0330/0351) Sleep, heat and supply. With the screen off (Power, SweetFramebuffer.cpp) for 3 s on AC or 1.8 s on
++ * battery, or the battery at herohot degrees (80 by default; the TMUs), the Mongoose cluster goes back to the
++ * bootloader's rate and voltage; with the screen on and the SoC 10 degrees cooler it goes to the cap: herocpu_mhz on
++ * AC, 1976 MHz on battery (GPU 546), and 1976/419 under 3550 mV. The A53s are left as they are.
+  * Boot-arg heropower=0: none of it. herotmu=0: the SoC's four TMUs are not read; by default they (BOOT DTB tmuctrl@1006x000, no clocks of their own)
+  * are read, nothing written, once a minute after the first two, for their calibration.
+  */
+@@ -2539,17 +2593,65 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 			    sensors & (1u << i) ? "" : " (not used)");
+ 		}
+ 	}
+-	printf("HEROLTE POWER: Mongoose to %u MHz with the screen off or the SoC at %u C (back under %u C)\n", hp_boot_mhz(), hot, cool);
+-	bool hot_now = false;
++	printf("HEROLTE POWER: Mongoose to %u MHz with the screen off or the SoC at %u C (back under %u C); battery cap 1976/546\n",
++	    hp_boot_mhz(), hot, cool);
++	bool hot_now = false, last_ac = false, logged = false, logged_ac = false;
+ 	uint64_t last_log = 0;
+ 	int top = -1000, seen_max = -1000;
++	uint32_t cap_cpu = hc.mhz, cap_gpu = 650, logged_cpu = 0, logged_gpu = 0;
++	unsigned vbat_hist[5] = { 0 }, vbat_n = 0, last_mv = 0;
+ 	for (;;) {
+ 		hg_pwr_msleep(200);
+ 		uint64_t now = mach_absolute_time(), off = herolte_screen_off_at, ns = 0;
+ 		if (off != 0 && now > off) {
+ 			absolutetime_to_nanoseconds(now - off, &ns);
+ 		}
+-		bool screen_off = off != 0 && ns > 3ull * NSEC_PER_SEC;
++		/*
++		 * Charger: the gauge's current, positive when charging.  Hysteresis
++		 * keeps the state when the current is near zero (full battery on AC).
++		 */
++		unsigned mv = herolte_fg_mv;
++		int ma = herolte_fg_ma;
++		bool ac = last_ac;
++		if (mv != 0) {
++			if (ma > 20) {
++				ac = true;
++			} else if (ma < -20) {
++				ac = false;
++			}
++		}
++		last_ac = ac;
++		if (mv != 0 && mv != last_mv) {
++			/* The gauge updates about once a second; five distinct samples. */
++			vbat_hist[vbat_n++ % 5] = mv;
++			last_mv = mv;
++		}
++		unsigned vbat = 0, vn = vbat_n < 5 ? vbat_n : 5;
++		for (unsigned i = 0; i < vn; i++) {
++			vbat += vbat_hist[i];
++		}
++		if (vn) {
++			vbat /= vn;
++		}
++		/* 3 s on AC, 1.8 s on battery; the SoC being hot forces the low rate too. */
++		bool screen_off = off != 0 && ns > (ac ? 3ull * NSEC_PER_SEC : 1800ull * NSEC_PER_MSEC);
++		cap_cpu = ac ? hc.mhz : 1976;
++		cap_gpu = ac ? 650 : (vbat != 0 && vbat < 3550 ? 419 : 546);
++		if (cap_gpu != hg_gpu_cap) {
++			hg_gpu_cap = cap_gpu;
++			if (!screen_off) {
++				hg_msleep(50);          /* let the running job finish */
++				(void)hg_gpu_rate(cap_gpu);
++			}
++		}
++		if (!logged || ac != logged_ac || cap_cpu != logged_cpu || cap_gpu != logged_gpu) {
++			printf("HEROLTE PWR: src=%s cap_cpu=%u cap_gpu=%u vbat=%umV\n",
++			    ac ? "ac" : "bat", cap_cpu, cap_gpu, vbat);
++			logged = true;
++			logged_ac = ac;
++			logged_cpu = cap_cpu;
++			logged_gpu = cap_gpu;
++		}
+ 		int c[4] = { -1000, -1000, -1000, -1000 };
+ 		top = -1000;
+ 		for (unsigned i = 0; i < 4; i++) {
+@@ -2571,19 +2673,22 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 				hot_now = false;
+ 			}
+ 		}
+-		bool want_low = screen_off || hot_now;
+-		if (!hc.broken && want_low == hc.high) {
+-			bool ok = want_low ? hc_go_low() : hc_go_high();
+-			printf("HEROLTE POWER: Mongoose %s %u MHz (screen %s%s, SoC %d C)\n", ok ? "to" : "NOT to",
+-			    want_low ? hp_boot_mhz() : hc.mhz, screen_off ? "off" : "on", hot_now ? ", hot" : "", top);
++		uint32_t target = (screen_off || hot_now) ? 0 : cap_cpu;
++		if (!hc.broken && target != hc.rate_mhz) {
++			bool ok = target == 0 ? hc_go_low() : hc_go_rate(target);
++			printf("HEROLTE POWER: Mongoose %s %u MHz (screen %s%s, src %s, vbat %u mV, SoC %d C)\n",
++			    ok ? "to" : "NOT to", target == 0 ? hp_boot_mhz() : target,
++			    screen_off ? "off" : "on", hot_now ? ", hot" : "", ac ? "ac" : "bat", vbat, top);
+ 		}
+ 		uint64_t since = 0;
+ 		absolutetime_to_nanoseconds(now - last_log, &since);
+ 		if (last_log == 0 || since > 60ull * NSEC_PER_SEC) {
+ 			last_log = now;
+ 			int b = herolte_fg_temp_dc;
+-			printf("HEROLTE POWER: SoC %d C (big %d, little %d, GPU %d, ISP %d; most %d), battery reg %d.%u C, Mongoose %s, screen %s\n",
+-			    top, c[0], c[1], c[2], c[3], seen_max, b / 10, (unsigned)(b < 0 ? -b : b) % 10, hc.high ? "up" : "down", off ? "off" : "on");
++			printf("HEROLTE POWER: SoC %d C (big %d, little %d, GPU %d, ISP %d; most %d), batt %d.%u C, src %s, vbat %u mV, cap %u/%u, Mongoose %u MHz, screen %s\n",
++			    top, c[0], c[1], c[2], c[3], seen_max, b / 10, (unsigned)(b < 0 ? -b : b) % 10,
++			    ac ? "ac" : "bat", vbat, cap_cpu, cap_gpu,
++			    hc.rate_mhz ? hc.rate_mhz : hp_boot_mhz(), off ? "off" : "on");
+ 			seen_max = -1000;
+ 		}
+ 	}
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+index 8ce84d0..f16674e 100644
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -32,6 +32,10 @@ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah,
+ /* DTB fuelgauge,capacity_max: Samsung shows 99.0 % of REPSOC as 100 %. */
+ #define FG_CAPACITY_MAX 990u
+ 
++/* Last good sample, for bsd/dev/herolte_gpu.c's power thread: one I2C user. */
++volatile unsigned herolte_fg_mv;
++volatile int herolte_fg_ma;
++
+ #define HSI2C_CTL       0x00
+ #define HSI2C_FIFO_CTL  0x04
+ #define HSI2C_TRAILING  0x08
+@@ -215,6 +219,8 @@ herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, uns
+ 	*percent = p > 100 ? 100 : p;
+ 	*mv = (unsigned)(((uint64_t)vcell * 78125u) / 1000000u);
+ 	*ma = (int)(((int64_t)(int16_t)current * 15625) / 100000);
++	herolte_fg_mv = *mv;
++	herolte_fg_ma = *ma;
+ 	*rem_mah = rem / 2u;
+ 	*full_mah = full / 2u;
+ 	return 0;
