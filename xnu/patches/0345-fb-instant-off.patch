@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2421880..4a72524 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -523,35 +523,36 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * Black at once. This used to halve every channel over seven vsyncs, which read as the screen dimming
++		 * instead of going out: the panel is OLED, so a black frame draws no light at all and there is nothing to
++		 * fade towards. One tick, then the slow timer.
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
+-		}
++		fb->fFadeStep = 7;
+ 		IOLockUnlock(fb->fLock);
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 		if (step == 0) {
+ 			herolte_fb_primary();
+ 		}
+ #endif
+-		if (step <= 6) {
++		if (step == 0) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++					row[x] = 0;
+ 				}
+ 			}
+ 		}
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+-		if (step > 6) {
+-			/* (0330) black and off: 5 ticks a second instead of 60, so that whatever waits for them sleeps */
+-			fb->fVsyncNext = 0;
+-			sender->setTimeoutMS(200);
+-			return;
+-		}
+-#endif
++		/* (0330) black and off: 5 ticks a second instead of 60, so that whatever waits for them sleeps */
++		fb->fVsyncNext = 0;
++		sender->setTimeoutMS(200);
++		return;
++#else
+ 		fb->rearmVsync(sender);
+ 		return;
++#endif
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->fShow == NULL;
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
