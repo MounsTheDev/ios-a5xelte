@@ -1,13 +1,13 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..18abe94 100644
+index 26fefa3..fbea006 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
-@@ -61,6 +61,26 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
+@@ -61,6 +61,23 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
  static bool bt_started;
  static int bt_sleep;
  
 +/*
-+ * (0356) The clock that was missing.  The bootloader never configured UART1:
++ * (0356, reworked by 0357) The clock that was missing.  The bootloader never configured UART1:
 + * bt1 read it back as ulcon=0 ucon=0x3000 ubrdiv=0 ufrac=0, i.e. no line
 + * format and no divisor, so HCI_Reset went out over a UART that was not
 + * transmitting and the chip never answered.  ucon=0x3000 is only the two
@@ -16,20 +16,17 @@ index 26fefa3..18abe94 100644
 + * opened here before any divider is written, the way Linux's exynos8890 clock
 + * driver does for the UART:
 + *
-+ *   0x10570000 PLL_1443X  (raw PLL registers: pll_con0 low, pll_con1 high)
-+ *   0x14C80000 CMU_PERIC1  (CMU gate 0x800, source 0x400, divisor 0x500)
++ *   0x14C80000 CMU_PERIC1  (gate 0x800; written, never read)
 + *
-+ * Every write keeps the bits it does not own, and each interesting value is
-+ * logged whether it was read or written, so one journal line tells the next
-+ * session what was actually there.
++ * 0357 removed the raw 0x10570000 read and the read-back of the CMU block:
++ * a gated block aborts on a read and nothing here proved it was gated on.
 + */
-+#define BT_CMU_PERI_PA   0x10570000u    /* raw PLL registers: PLL1416X/PLL1443X */
-+#define BT_CMU_PERIC1_PA 0x14C80000u    /* UART1 gate, clock source, divider */
++#define BT_CMU_PERIC1_PA 0x14C80000u    /* UART1 gate (0x800); written, never read */
 +
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +133,112 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +130,114 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -64,39 +61,40 @@ index 26fefa3..18abe94 100644
 + * a cold run after the bootloader (which left everything at zero) works as
 + * well as a warm one from a driver that already powered the block.
 + */
-+static uint32_t bt_cmu_gate, bt_cmu_src, bt_cmu_div, bt_pll_con0, bt_pll_con1;
-+
 +static void
 +bt_uart_clock(void)
 +{
-+	vm_offset_t peri = ml_io_map(BT_CMU_PERI_PA, 0x1000);
-+	vm_offset_t cmu = ml_io_map(BT_CMU_PERIC1_PA, 0x1000);
-+	if (!peri || !cmu) {
-+		BT_LOG("HEROLTE BT: CMU mapping failed");
++	/*
++	 * (0357) No blind read of a CMU block.  bt2 mapped 0x10570000 and
++	 * 0x14C80000 and dereferenced them at once; on this port a register of a
++	 * gated block is an external abort (herolte_gpu.c learned the same on the
++	 * Wi-Fi gate: far ...854, esr 0x96000210), and ml_io_map answering
++	 * non-NULL says nothing about the clock being on.  The UART's own pages are
++	 * already mapped and known to answer (S-Boot used the block), so the switch
++	 * clock is chosen there and only the two CMU writes are made, without
++	 * reading first: a write to a gated block is dropped, not aborted.
++	 *
++	 * UCON bits 10:9 are the clock source.  Samsung's exynos8890 clock driver
++	 * names source 0 "oscclk", 1 "sclk_uart1" (the PLL), 2 "sclk_uart1_user";
++	 * 1 is what Linux programs, and it is what bt2 tried to reach through the
++	 * CMU before reading it.
++	 */
++	uint32_t ucon = bt_rd(bt_uart, UART_UCON);
++	if (ucon == 0xffffffffu) {
++		BT_LOG("HEROLTE BT: uart regs dead, no clock to set");
 +		return;
 +	}
-+	bt_pll_con0 = bt_rd(peri, 0x000);
-+	bt_pll_con1 = bt_rd(peri, 0x004);
-+	bt_cmu_gate = bt_rd(cmu, 0x800);
-+	bt_cmu_src = bt_rd(cmu, 0x400);
-+	bt_cmu_div = bt_rd(cmu, 0x500);
-+	unsigned locked = (unsigned)((bt_pll_con1 >> 21) & 1u);
-+	unsigned mux = (unsigned)(bt_cmu_src & 0x3u);
-+	/* Clock source 1 (the PLL) when the PLL is locked, else the oscillator. */
-+	unsigned want_mux = locked ? 1u : 0u;
-+	if (mux != want_mux) {
-+		bt_wr(cmu, 0x400, (bt_cmu_src & ~0x3u) | want_mux);
++	/* Source 1 (the PLL), keeping the baud clock switch in bit 8 clear. */
++	bt_wr(bt_uart, UART_UCON, (ucon & ~(3u << 9)) | (1u << 9));
++	bt_uart_src = (bt_rd(bt_uart, UART_UCON) >> 9) & 3u;
++	/* Gate 5 (UART1) and its bus gate 4: set only, never read back. */
++	vm_offset_t cmu = ml_io_map(BT_CMU_PERIC1_PA, 0x1000);
++	if (cmu) {
++		bt_wr(cmu, 0x800, 0x30u);                        /* parent gate, then bus gate */
 +	}
-+	/* Divisor 1: UART1 divides its source by 1 and the UART does the rest. */
-+	if ((bt_cmu_div & 0xfu) != 1u) {
-+		bt_wr(cmu, 0x500, (bt_cmu_div & ~0xfu) | 1u);
-+	}
-+	/* Gate 5 and its child bus gate 4 drive UART1 on PERIC1. */
-+	if ((bt_cmu_gate & 0x30u) != 0x30u) {
-+		bt_wr(cmu, 0x800, bt_rd(cmu, 0x800) | 0x30u);
-+	}
-+	BT_LOG("HEROLTE BT: cmu pll=%#x/%#x locked=%u gate=%#x src=%#x(->%u) div=%#x(->1)",
-+	    bt_pll_con0, bt_pll_con1, locked, bt_cmu_gate, bt_cmu_src, want_mux, bt_cmu_div);
++	BT_LOG("HEROLTE BT: clock ucon=%#x src=%u cmu=%s",
++	    bt_rd(bt_uart, UART_UCON), bt_uart_src,
++	    cmu ? "gate 0x30 written, not read" : "map failed, block untouched");
 +}
 +
 +/*
@@ -127,6 +125,7 @@ index 26fefa3..18abe94 100644
 +	uint32_t want = (ucon & 0x100u) | 0x3c5u;
 +	if (ucon != 0xffffffffu) {
 +		want |= ucon & 0x3000u;                         /* keep its RX timeout */
++		want |= ucon & (3u << 9);                       /* keep the clock source */
 +	}
 +	bt_wr(bt_uart, UART_UCON, want);
 +	if (ubrdiv == 0 || ubrdiv > 1000) {
@@ -142,7 +141,7 @@ index 26fefa3..18abe94 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +375,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +374,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -150,7 +149,7 @@ index 26fefa3..18abe94 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,38 +391,25 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,38 +390,25 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
