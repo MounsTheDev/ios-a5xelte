@@ -242,10 +242,18 @@ index 961f7e3..85319c9 100644
  		if (off != 0 && now > off) {
  			absolutetime_to_nanoseconds(now - off, &ns);
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index eba2cd8..32d4422 100644
+index eba2cd8..10b98b2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1253,16 +1253,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -75,6 +75,7 @@ extern "C" bool herolte_gpu_present_draw(int s, uint32_t off, uint32_t stride, u
+ extern "C" bool herolte_fb_two_buffers(void);
+ extern "C" void herolte_fb_primary(void);
+ extern "C" volatile uint64_t herolte_screen_off_at;    /* bsd/dev/herolte_gpu.c (0330) */
++extern "C" void herolte_panel_power(bool on);          /* bsd/dev/herolte_gpu.c (0350) */
+ extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c, sysctl kern.timer_coalescing_enabled */
+ #endif
+ 
+@@ -1253,16 +1254,28 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  				IOLog("A5XELTE FB: display-off after Power press\n");
  			}
  #endif
@@ -263,7 +271,6 @@ index eba2cd8..32d4422 100644
  			herolte_screen_off_at = off ? mach_absolute_time() : 0;
 +			if (changed) {
 +				/* (0350) panel DCS off/sleep, GPU rate: bsd/dev/herolte_gpu.c */
-+				extern "C" void herolte_panel_power(bool on);
 +				herolte_panel_power(!off);
 +				if (!off) {
 +					/* the panel is awake again: force one frame */
