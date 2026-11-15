@@ -1,0 +1,388 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
++bsd/dev/herolte_touchkey.c		standard
+ bsd/dev/herolte_gpu.c			standard
+ bsd/dev/herolte_drop.c			standard
+ bsd/dev/herolte_drop_core.c		standard
+ bsd/dev/herolte_wifi.c			standard
+diff --git a/bsd/dev/herolte_touchkey.c b/bsd/dev/herolte_touchkey.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_touchkey.c
+@@ -0,0 +1,359 @@
++/*
++ * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) capacitive touchkeys.
++ *
++ * Step 1: read the controller and log presses.  No gesture injection, no
++ * data write to a controller register, no LED regulator, no reset line.
++ * The only pins driven are the two I2C bus lines, and only to clock bytes.
++ *
++ * The bus is i2c-gpio, bit-banged.  The DTS puts SDA on GPE5-2 and SCL on
++ * GPE5-3 (the i2c-gpio binding would read the first cell as SCL, but the
++ * wiring and the child sda/scl-gpio properties agree on 2=SDA, 3=SCL).
++ * GPE5 is bank 1 of pinctrl@14CC0000, at +0x20:
++ * gpe0 0x00, gpe5 0x20, gpe6 0x40, gpj1 0x60, ... (pinctrl-exynos.c).
++ *
++ * The populated chip is an ABOV MC96FT16xx at 0x20: BTNSTATUS 0x00,
++ * FW version 0x01, PCB version 0x02, model 0x14.  sub-det (GPA3-0) reads 0,
++ * which the Linux driver treats as "ABOV present"; TWRP reports
++ * touchkey_get_chip_vendor=ABOV and firmware 0x0f.  IRQ is GPA0-0, active
++ * low.  XNU routes no GPIO interrupts, so the thread polls: IRQ level first,
++ * then BTNSTATUS (reading it clears the event, as the Linux handler does).
++ *
++ * BTNSTATUS: bits 1:0 = recent (2 press, 1/3 release), bits 3:2 = back.
++ * Boot arg herotk=0 disables; it is not in the 604-byte command line.
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define HTK_PERIC1_PA   0x14CC0000u     /* GPE5 at +0x20 */
++#define HTK_ALIVE_PA    0x10580000u     /* GPA0 at +0x00, GPA3 at +0x60 */
++#define HTK_GPE5_CON    0x20u
++#define HTK_GPE5_DAT    0x24u
++#define HTK_GPE5_PUD    0x28u
++#define HTK_GPA0_CON    0x00u
++#define HTK_GPA0_DAT    0x04u
++#define HTK_GPA3_DAT    0x64u
++
++#define HTK_SCL         3u
++#define HTK_SDA         2u
++#define HTK_IRQ         0u
++#define HTK_ADDR        0x20u
++
++#define HTK_REG_STATUS  0x00u
++#define HTK_REG_FW      0x01u
++#define HTK_REG_PCB     0x02u
++#define HTK_REG_MODEL   0x14u
++
++static vm_offset_t htk_pins, htk_alive;
++static int htk_sleep;
++static bool htk_started;
++
++static uint32_t
++htk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++htk_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++htk_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&htk_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* 4 bits per pin in CON, 2 bits per pin in PUD (Samsung pinctrl). */
++static void
++htk_pin_fn(uint32_t con, unsigned pin, uint32_t fn)
++{
++	uint32_t v = htk_rd(htk_pins, con);
++	v = (v & ~(0xfu << (pin * 4))) | ((fn & 0xfu) << (pin * 4));
++	htk_wr(htk_pins, con, v);
++}
++
++static void
++htk_pin_pud(uint32_t pud, unsigned pin, uint32_t pull)
++{
++	uint32_t v = htk_rd(htk_pins, pud);
++	v = (v & ~(0x3u << (pin * 2))) | ((pull & 0x3u) << (pin * 2));
++	htk_wr(htk_pins, pud, v);
++}
++
++/*
++ * Open-drain emulation: drive low with CON=output/DAT=0, release with
++ * CON=input and let the board pull-ups raise the line.  PUD stays 0, like
++ * the Linux cfg-i2c state; the external pull-ups were measured high.
++ */
++static void
++htk_scl(int high)
++{
++	if (high) {
++		htk_pin_fn(HTK_GPE5_CON, HTK_SCL, 0);
++	} else {
++		uint32_t v = htk_rd(htk_pins, HTK_GPE5_DAT);
++		htk_wr(htk_pins, HTK_GPE5_DAT, v & ~(1u << HTK_SCL));
++		htk_pin_fn(HTK_GPE5_CON, HTK_SCL, 1);
++	}
++}
++
++static void
++htk_sda(int high)
++{
++	if (high) {
++		htk_pin_fn(HTK_GPE5_CON, HTK_SDA, 0);
++	} else {
++		uint32_t v = htk_rd(htk_pins, HTK_GPE5_DAT);
++		htk_wr(htk_pins, HTK_GPE5_DAT, v & ~(1u << HTK_SDA));
++		htk_pin_fn(HTK_GPE5_CON, HTK_SDA, 1);
++	}
++}
++
++static int
++htk_sda_read(void)
++{
++	return (int)((htk_rd(htk_pins, HTK_GPE5_DAT) >> HTK_SDA) & 1u);
++}
++
++static void
++htk_delay(void)
++{
++	delay(2);       /* i2c-gpio,delay-us = 2: about 160 kHz with the calls */
++}
++
++static void
++htk_start(void)
++{
++	htk_sda(1);
++	htk_scl(1);
++	htk_delay();
++	htk_sda(0);
++	htk_delay();
++	htk_scl(0);
++	htk_delay();
++}
++
++static void
++htk_stop(void)
++{
++	htk_sda(0);
++	htk_delay();
++	htk_scl(1);
++	htk_delay();
++	htk_sda(1);
++	htk_delay();
++}
++
++static bool
++htk_write_byte(uint8_t byte)
++{
++	for (int i = 7; i >= 0; i--) {
++		htk_scl(0);
++		htk_delay();
++		htk_sda((byte >> i) & 1u);
++		htk_delay();
++		htk_scl(1);
++		htk_delay();
++	}
++	htk_scl(0);
++	htk_delay();
++	htk_sda(1);
++	htk_delay();
++	htk_scl(1);
++	htk_delay();
++	bool ack = !htk_sda_read();
++	htk_scl(0);
++	htk_delay();
++	return ack;
++}
++
++static uint8_t
++htk_read_byte(bool ack)
++{
++	uint8_t byte = 0;
++	for (int i = 0; i < 8; i++) {
++		htk_scl(0);
++		htk_delay();
++		htk_sda(1);
++		htk_delay();
++		htk_scl(1);
++		htk_delay();
++		byte = (uint8_t)((byte << 1) | htk_sda_read());
++		htk_scl(0);
++		htk_delay();
++	}
++	htk_sda(ack ? 0 : 1);
++	htk_delay();
++	htk_scl(1);
++	htk_delay();
++	htk_scl(0);
++	htk_delay();
++	htk_sda(1);
++	return byte;
++}
++
++/*
++ * Register read as two transfers, which is what the Linux driver does:
++ * start, addr+W, reg, stop, start, addr+R, data, NAK, stop.  No data byte
++ * is ever written to the chip.
++ */
++static bool
++htk_read_reg(uint8_t reg, uint8_t *value)
++{
++	bool ok = false;
++
++	htk_start();
++	if (!htk_write_byte((uint8_t)(HTK_ADDR << 1))) {
++		goto out;
++	}
++	if (!htk_write_byte(reg)) {
++		goto out;
++	}
++	htk_stop();
++	htk_delay();
++	htk_start();
++	if (!htk_write_byte((uint8_t)((HTK_ADDR << 1) | 1u))) {
++		goto out;
++	}
++	*value = htk_read_byte(false);
++	ok = true;
++out:
++	htk_stop();
++	return ok;
++}
++
++static void
++htk_bus_recover(void)
++{
++	/* A slave left mid-byte holds SDA low: clock it free, then stop. */
++	htk_sda(1);
++	for (int i = 0; i < 9 && !htk_sda_read(); i++) {
++		htk_scl(0);
++		htk_delay();
++		htk_scl(1);
++		htk_delay();
++	}
++	htk_stop();
++}
++
++static char
++htk_state(unsigned pair)
++{
++	if (pair == 0) {
++		return '-';
++	}
++	return (pair == 2) ? 'P' : 'R';
++}
++
++static void
++htk_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t fw = 0, pcb = 0, model = 0, status = 0;
++	uint8_t last = 0xff;
++	int last_irq = -1;
++	unsigned polls = 0, naks = 0;
++
++	htk_msleep(3000);
++
++	/* Mux both lines to GPIO, no internal pull (external pull-ups). */
++	htk_pin_pud(HTK_GPE5_PUD, HTK_SCL, 0);
++	htk_pin_pud(HTK_GPE5_PUD, HTK_SDA, 0);
++	htk_scl(1);
++	htk_sda(1);
++	htk_msleep(2);
++
++	printf("HEROLTE TK: gpe5 con=%#x dat=%#x pud=%#x\n",
++	    htk_rd(htk_pins, HTK_GPE5_CON), htk_rd(htk_pins, HTK_GPE5_DAT),
++	    htk_rd(htk_pins, HTK_GPE5_PUD));
++	printf("HEROLTE TK: gpa0 con=%#x dat=%#x gpa3 dat=%#x\n",
++	    htk_rd(htk_alive, HTK_GPA0_CON), htk_rd(htk_alive, HTK_GPA0_DAT),
++	    htk_rd(htk_alive, HTK_GPA3_DAT));
++
++	htk_bus_recover();
++	bool fw_ok = htk_read_reg(HTK_REG_FW, &fw);
++	bool pcb_ok = htk_read_reg(HTK_REG_PCB, &pcb);
++	bool model_ok = htk_read_reg(HTK_REG_MODEL, &model);
++	bool st_ok = htk_read_reg(HTK_REG_STATUS, &status);
++	printf("HEROLTE TK: id fw=%#x pcb=%#x model=%#x st=%#x %d%d%d%d\n",
++	    fw, pcb, model, status, fw_ok, pcb_ok, model_ok, st_ok);
++	if (!fw_ok && !pcb_ok && !model_ok && !st_ok) {
++		printf("HEROLTE TK: no ACK at 0x20 sda=%d scl=%d\n",
++		    htk_sda_read(), (int)((htk_rd(htk_pins, HTK_GPE5_DAT) >>
++		    HTK_SCL) & 1u));
++	}
++
++	for (;;) {
++		int irq = (int)((htk_rd(htk_alive, HTK_GPA0_DAT) >> HTK_IRQ) & 1u);
++		uint8_t raw = 0;
++		bool ok = htk_read_reg(HTK_REG_STATUS, &raw);
++
++		if (ok) {
++			naks = 0;
++			if (raw != last || irq != last_irq) {
++				printf("HEROLTE TK: raw=%#x irq=%d rec=%c back=%c\n",
++				    raw, irq, htk_state(raw & 3u),
++				    htk_state((raw >> 2) & 3u));
++				last = raw;
++				last_irq = irq;
++			}
++		} else {
++			naks++;
++			if (naks == 1 || (naks % 250) == 0) {
++				printf("HEROLTE TK: nak n=%u irq=%d\n", naks, irq);
++			}
++		}
++		if ((++polls % 250) == 0) {
++			printf("HEROLTE TK: poll=%u raw=%#x irq=%d nak=%u\n",
++			    polls, last, last_irq, naks);
++		}
++		htk_msleep(20);
++	}
++}
++
++void
++herolte_touchkey_probe(void)
++{
++	thread_t thread;
++	int enabled = 1;
++
++	if (htk_started) {
++		return;
++	}
++	htk_started = true;
++	(void)PE_parse_boot_argn("herotk", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("HEROLTE TK: disabled\n");
++		return;
++	}
++	htk_pins = ml_io_map(HTK_PERIC1_PA, 0x1000);
++	htk_alive = ml_io_map(HTK_ALIVE_PA, 0x1000);
++	if (!htk_pins || !htk_alive) {
++		printf("HEROLTE TK: mapping failed\n");
++		return;
++	}
++	printf("HEROLTE TK: probe\n");
++	kern_return_t kr = kernel_thread_start(htk_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("HEROLTE TK: thread start failed %d\n", kr);
++	}
++}
++#endif
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -775,6 +775,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
+ 	a5xelte_keys_init();
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Capacitive touchkeys: ABOV on the bit-banged i2c@20. */
++	extern void herolte_touchkey_probe(void);
++	herolte_touchkey_probe();
+ 	/* sec_ts on the Exynos 8890 HSI2C (bsd/dev/herolte_touch.c). */
+ 	extern void herolte_touch_probe(void);
+ 	herolte_touch_probe();

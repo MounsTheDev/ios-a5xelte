@@ -412,7 +412,7 @@ retour), inactives sous iOS.
 
 ```
 i2c@20 : compatible = "i2c-gpio"        ← bus BIT-BANGÉ, pas un contrôleur HSI2C
-         gpios = <phandle 0x5a pin 2>, <phandle 0x5a pin 3>   (SCL, SDA)
+         gpios = <phandle 0x5a pin 2>, <phandle 0x5a pin 3>   (SDA, SCL)
          i2c-gpio,delay-us présent
          enfants : touchkey@20 (mc96ft16xx) et touchkey@40 (cypress_touchkey)
 ```
@@ -425,9 +425,31 @@ Linux les expose en `/sys/bus/i2c/devices/10-0020` et `10-0040`.
 - le bus du tactile principal est différent (0x48 sur HSI2C `0x14E10000`) ;
 - il n'y a **pas** de nœud `touchkey` sur les bus HSI2C `0x136x0000`.
 
-**Ce qui manque encore** : résoudre le phandle `0x5a` vers un banc GPIO concret
-(les nœuds `gpio*` de l'arbre n'exposent pas de `phandle` lisible simplement —
-passer par les `pinctrl-0/1/2` du nœud `i2c@20`), et le GPIO d'interruption.
+**Résolu le 15 novembre 2026** (arbre vivant sous TWRP + `pinctrl-exynos.c`
+d'`android_kernel_samsung_universal8890`) :
+
+| Élément | Valeur |
+|---|---|
+| phandle `0x5a` | `pinctrl@14CC0000/gpe5` (banc GPE5, 8 pins) |
+| Base du banc | **`0x14CC0000 + 0x20`** — table PERIC1 : gpe0 `0x00`, **gpe5 `0x20`**, gpe6 `0x40`, gpj1 `0x60`… |
+| Registres | CON `+0x00`, DAT `+0x04`, PUD `+0x08` |
+| SDA | **GPE5-2** |
+| SCL | **GPE5-3** |
+| IRQ | **GPA0-0**, actif bas (`pinctrl@10580000`, CON `0x00`, DAT `0x04`) |
+| Contrôleur monté | **ABOV MC96FT16xx** à `0x20` (sub-det GPA3-0 = 0 ; TWRP : `touchkey_get_chip_vendor=ABOV`, fw `0x0f`) |
+| Registres ABOV | `0x00` BTNSTATUS (bits 1:0 récent, 3:2 retour ; 2=appui, 1/3=relâche), `0x01` fw, `0x02` PCB, `0x14` modèle |
+| Alimentation | S2MPB02 **LDO16** (`TOUCH_VDD_3.3V`), `boot-on-ldo`, laissée allumée par S-Boot |
+
+⚠️ **L'ordre des pins est inversé par rapport à la note d'origine** : le
+pilote `i2c-gpio` de Samsung lit le **premier** `gpios` comme **SDA**
+(`i2c-gpio.c` : `*sda_pin = of_get_gpio(np, 0)`), et les propriétés enfants
+`abov,sda-gpio`/`abov,scl-gpio` le confirment. Ne pas suivre le binding
+mainline (SCL d'abord) : le bus ne répondrait pas.
+
+Le pilote de l'étape 1 est `bsd/dev/herolte_touchkey.c` (patch `0347`) : il
+muxe GPE5-2/3 en GPIO, bit-bang à ~160 kHz, lit `0x00`/`0x01`/`0x02`/`0x14`
+et journalise les appuis. Il ne pilote que les deux lignes du bus ; aucun
+geste, aucun registre du contrôleur n'est écrit, pas de rétroéclairage.
 
 ### Plan de travail recommandé
 
@@ -497,7 +519,13 @@ HEROLTE GL: backboardd launch 1: EAGL shim inserted
 SWEET FB: AppleCLCD 1440x2560 …
 HEROLTE DROP: package N ready for userland
 HEROLTE CPU: Mongoose at 2600 MHz
+HEROLTE TK: id fw=0xf pcb=… model=… st=… 1111
 ```
+
+Les quatre `1` de la ligne `HEROLTE TK: id` sont les ACK des lectures
+`0x01`/`0x02`/`0x14`/`0x00`. Un `0` signifie que le contrôleur n'a pas
+acquitté : vérifier d'abord l'alimentation (S2MPB02 LDO16, `TOUCH_VDD_3.3V`,
+`regulator-boot-on`), puis SDA/SCL (GPE5-2/GPE5-3, pas l'inverse).
 
 ---
 
