@@ -316,7 +316,7 @@ new file mode 100644
 +	uint8_t dl = sizeof(dummy);
 +	bool mini = bt_hci_cmd(0xfc2e, NULL, 0, dummy, &dl, 200);
 +	BT_LOG("HEROLTE BT: minidriver ok=%d", mini);
-+	uint8_t *fw = (uint8_t *)kalloc(BT_FW_MAX);
++	uint8_t *fw = (uint8_t *)kalloc_data(BT_FW_MAX, Z_WAITOK);
 +	uint32_t fwlen = 0;
 +	if (fw != NULL) {
 +		fwlen = bt_read_file(BT_FW_PATH, fw, BT_FW_MAX);
@@ -324,7 +324,7 @@ new file mode 100644
 +		if (fwlen) {
 +			bt_download(fw, fwlen);
 +		}
-+		kfree(fw, BT_FW_MAX);
++		kfree_data(fw, BT_FW_MAX);
 +	} else {
 +		BT_LOG("HEROLTE BT: no memory for the firmware");
 +	}
