@@ -451,6 +451,12 @@ muxe GPE5-2/3 en GPIO, bit-bang à ~160 kHz, lit `0x00`/`0x01`/`0x02`/`0x14`
 et journalise les appuis. Il ne pilote que les deux lignes du bus ; aucun
 geste, aucun registre du contrôleur n'est écrit, pas de rétroéclairage.
 
+Image de l'étape 1 : `build/xnu-boot-tk1.img`, sha256
+`ac9e96a4073a343a422b270bbddd39a52074a813046b6360319c90019e80d414`
+(build `xnu` 43723723649, 14 min 06 s, aucun patch sauté). Vérifiée par
+`herolte-verify-boot.py` : 0 fallos. Le noyau contient le symbole
+`_herolte_touchkey_probe` et les chaînes `HEROLTE TK`.
+
 ### Plan de travail recommandé
 
 1. **Étape 1 — lire, ne rien injecter.** I2C bit-bangé sur les deux broches,
