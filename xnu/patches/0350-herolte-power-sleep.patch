@@ -1,0 +1,277 @@
+diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
+index 961f7e3..85319c9 100644
+--- a/bsd/dev/herolte_gpu.c
++++ b/bsd/dev/herolte_gpu.c
+@@ -63,6 +63,7 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+ #define L2_READY_LO             0x160
+ 
+ static int hg_sleep;
++static int hg_pwr_sleep;
+ 
+ static uint32_t
+ hg_rd(vm_offset_t base, uint32_t off)
+@@ -81,6 +82,16 @@ hg_msleep(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* The power thread's own channel, so a wake can move the CPU at once. */
++static void
++hg_pwr_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hg_pwr_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /*
+  * (0333) A client's job is waited for asleep, not by spinning: backboardd's ~1100 jobs a second kept its submit
+  * thread on a Mongoose core in delay(10) for as long as the GPU worked -- a third of all its samples
+@@ -422,74 +433,71 @@ hg_clock_report(void)
+ 	    c1 - c0, us, us ? (c1 - c0) / us : 0);
+ }
+ 
++static uint32_t hg_gpu_mhz_now;
++
+ /*
+- * Boot-arg herogpu_mhz=338 to 650: vdd_g3d is raised to this phone's table and
+- * G3D_PLL relocked at that rate, before the GPU has any work (once the PMIC was not
+- * touched, so only these small steps above its 260 MHz are accepted). Without
+- * the boot-arg nothing is written. A PLL that does not lock goes back.
++ * This phone's own table, as its Samsung kernel prints it (asv_table, G3D
++ * ASV group 11). vdd_g3d register = (mV - 300) / 6.25: 0x30 is the 600 mV and
++ * MIF's 0x53 the 818 mV Linux reports after the same bootloader.
+  */
+-static void
+-hg_clock_set(void)
++static const struct {
++	uint32_t mhz, m, s;
++	uint8_t volt;
++} hg_gpu_rates[] = {
++	{ 338, 208, 2, 0x30 },  /* 600 mV */
++	{ 390, 240, 2, 0x32 },  /* the 612.5 mV of 419: between the table's rates, the higher one */
++	{ 419, 258, 2, 0x32 },  /* 612.5 mV */
++	{ 546, 168, 1, 0x3a },  /* 662.5 mV */
++	{ 600, 185, 1, 0x3d },  /* 681.25 mV */
++	{ 650, 200, 1, 0x40 },  /* 700 mV */
++};
++
++/*
++ * G3D_PLL and vdd_g3d to a rate from the table.  Up: the voltage first, then
++ * the PLL.  Down: the PLL first, then the voltage.  Called at boot (650) and
++ * by the panel sleep hook (338); a PLL that does not lock goes back.
++ */
++static bool
++hg_gpu_rate(uint32_t mhz)
+ {
+ 	extern bool herolte_apm_g3d_voltage(uint8_t value);
+-	/*
+-	 * This phone's own table, as its Samsung kernel prints it (asv_table, G3D
+-	 * ASV group 11). vdd_g3d register = (mV - 300) / 6.25: 0x30 is the 600 mV and
+-	 * MIF's 0x53 the 818 mV Linux reports after the same bootloader.
+-	 */
+-	static const struct {
+-		uint32_t mhz, m, s;
+-		uint8_t volt;
+-	} rates[] = {
+-		{ 338, 208, 2, 0x30 },  /* 600 mV */
+-		{ 390, 240, 2, 0x32 },  /* the 612.5 mV of 419: between the table's rates, the higher one */
+-		{ 419, 258, 2, 0x32 },  /* 612.5 mV */
+-		{ 546, 168, 1, 0x3a },  /* 662.5 mV */
+-		{ 600, 185, 1, 0x3d },  /* 681.25 mV */
+-		{ 650, 200, 1, 0x40 },  /* 700 mV */
+-	};
+-	uint32_t mhz = 0, m = 0, s = 2;
++	uint32_t m = 0, s = 2;
+ 	uint8_t volt = 0, now = 0;
+ 
+-	if (!PE_parse_boot_argn("herogpu_mhz", &mhz, sizeof(mhz))) {
+-		return;
++	if (mhz == hg_gpu_mhz_now) {
++		return true;
+ 	}
+-	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+-		if (rates[i].mhz == mhz) {
+-			m = rates[i].m;
+-			s = rates[i].s;
+-			volt = rates[i].volt;
++	for (unsigned i = 0; i < sizeof(hg_gpu_rates) / sizeof(hg_gpu_rates[0]); i++) {
++		if (hg_gpu_rates[i].mhz == mhz) {
++			m = hg_gpu_rates[i].m;
++			s = hg_gpu_rates[i].s;
++			volt = hg_gpu_rates[i].volt;
+ 		}
+ 	}
+-	if (!m) {
+-		printf("HEROLTE GPU: clock: herogpu_mhz=%u not accepted\n", mhz);
+-		return;
++	if (!m || !herolte_apm_pmic_read(0x26, &now)) {
++		return false;
+ 	}
+-	/* The voltage first, and read back: without it the clock stays as the bootloader left it. */
+-	if (!herolte_apm_pmic_read(0x26, &now)) {
+-		printf("HEROLTE GPU: clock: cannot read vdd_g3d, %u MHz not set\n", mhz);
+-		return;
++	vm_offset_t top = ml_io_map(0x10570000u, 0x1000);
++	if (!top) {
++		return false;
+ 	}
+-	if (now < volt) {
++	uint32_t old = hg_rd(top, 0x1e0);
++	/* 26 MHz * M / (P << S): keep P 4 and S 2, as the bootloader has them. */
++	if (((old >> 8) & 0x3f) != 4 || (old & 0x7) != 2) {
++		printf("HEROLTE GPU: clock: G3D_PLL con0=%#x not as expected, left alone\n", old);
++		return false;
++	}
++	bool up = mhz > hg_gpu_mhz_now;
++	if (up && now < volt) {
+ 		uint8_t set = 0;
+ 		bool wrote = herolte_apm_g3d_voltage(volt);
+ 		delay(100);
+ 		if (!wrote || !herolte_apm_pmic_read(0x26, &set) || set != volt) {
+ 			printf("HEROLTE GPU: clock: vdd_g3d %#x -> %#x failed (now %#x), %u MHz not set\n", now, volt, set, mhz);
+-			return;
++			return false;
+ 		}
+ 		printf("HEROLTE GPU: clock: vdd_g3d %#x -> %#x\n", now, set);
+ 	}
+-	vm_offset_t top = ml_io_map(0x10570000u, 0x1000);
+-	if (!top) {
+-		return;
+-	}
+-	uint32_t old = hg_rd(top, 0x1e0);
+-	/* 26 MHz * M / (P << S): keep P 4 and S 2, as the bootloader has them. */
+-	if (((old >> 8) & 0x3f) != 4 || (old & 0x7) != 2) {
+-		printf("HEROLTE GPU: clock: G3D_PLL con0=%#x not as expected, left alone\n", old);
+-		return;
+-	}
+ 	hg_wr(top, 0x1e0, (old & ~((0x3ffu << 16) | 0x7u)) | (m << 16) | s);
+ 	bool locked = false;
+ 	for (unsigned i = 0; i < 1000 && !locked; i++) {
+@@ -499,8 +507,82 @@ hg_clock_set(void)
+ 	if (!locked) {
+ 		hg_wr(top, 0x1e0, old);
+ 		delay(1000);
++		printf("HEROLTE GPU: clock: G3D_PLL %u MHz did not lock, put back\n", mhz);
++		return false;
++	}
++	if (!up && now > volt) {
++		uint8_t set = 0;
++		bool wrote = herolte_apm_g3d_voltage(volt);
++		delay(100);
++		if (!wrote || !herolte_apm_pmic_read(0x26, &set) || set != volt) {
++			printf("HEROLTE GPU: clock: vdd_g3d down %#x -> %#x failed (now %#x)\n", now, volt, set);
++		}
++	}
++	printf("HEROLTE GPU: clock: G3D_PLL %#x -> %#x: locked (%u MHz)\n", old, hg_rd(top, 0x1e0), mhz);
++	hg_gpu_mhz_now = mhz;
++	return true;
++}
++
++static void
++hg_clock_set(void)
++{
++	uint32_t mhz = 0;
++	if (!PE_parse_boot_argn("herogpu_mhz", &mhz, sizeof(mhz))) {
++		return;
++	}
++	if (!hg_gpu_rate(mhz)) {
++		printf("HEROLTE GPU: clock: herogpu_mhz=%u not set\n", mhz);
++	}
++}
++
++/*
++ * DCS short write to the panel through DSIM 0x13900000, as Samsung's
++ * decon_8890 dsim_reg_wr_tx_header (DSIM_PKTHDR 0x3c, DSIM_FIFOCTRL 0x4c
++ * bit 10 = header FIFO empty).  The bootloader leaves the DSIM in command
++ * mode and HSCLKEN; no other driver owns it.  A short packet is ~10 us.
++ */
++static void
++hg_dcs_short(uint8_t cmd)
++{
++	vm_offset_t dsim = ml_io_map(0x13900000u, 0x1000);
++	if (!dsim) {
++		return;
++	}
++	for (unsigned i = 0; i < 2000; i++) {
++		if (hg_rd(dsim, 0x4c) & (1u << 10)) {
++			break;
++		}
++		delay(1);
++	}
++	hg_wr(dsim, 0x34, 1u << 28);                    /* clear PH FIFO empty */
++	hg_wr(dsim, 0x3c, 0x05u | ((uint32_t)cmd << 8)); /* DCS short write */
++	delay(2000);
++}
++
++/*
++ * Panel sleep/wake, called from SweetFramebuffer.cpp's RequestPowerChange on
++ * a real state change.  The CPU rate follows through herolte_screen_off_at
++ * and hg_power_thread (3 s debounce, 728 MHz); the GPU is moved here.
++ */
++void
++herolte_panel_power(bool on)
++{
++	if (on) {
++		(void)hg_gpu_rate(650);
++		/* hg_power_thread raises Mongoose now, not on its next 200 ms tick. */
++		thread_wakeup((event_t)&hg_pwr_sleep);
++		hg_dcs_short(0x11);     /* exit sleep */
++		hg_msleep(120);
++		hg_dcs_short(0x29);     /* display on */
++		printf("HEROLTE PWR: wake cpu=high gpu=%u dsi=11/29\n", hg_gpu_mhz_now);
++	} else {
++		hg_dcs_short(0x28);     /* display off */
++		hg_msleep(20);
++		hg_dcs_short(0x10);     /* enter sleep */
++		hg_msleep(50);          /* let the black frame's blit finish */
++		(void)hg_gpu_rate(338);
++		printf("HEROLTE PWR: sleep cpu=low(3s) gpu=%u dsi=28/10\n", hg_gpu_mhz_now);
+ 	}
+-	printf("HEROLTE GPU: clock: G3D_PLL %#x -> %#x: %s\n", old, hg_rd(top, 0x1e0), locked ? "locked" : "NOT locked, put back");
+ }
+ 
+ /*
+@@ -2462,7 +2544,7 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+ 	uint64_t last_log = 0;
+ 	int top = -1000, seen_max = -1000;
+ 	for (;;) {
+-		hg_msleep(200);
++		hg_pwr_msleep(200);
+ 		uint64_t now = mach_absolute_time(), off = herolte_screen_off_at, ns = 0;
+ 		if (off != 0 && now > off) {
+ 			absolutetime_to_nanoseconds(now - off, &ns);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eba2cd8..97c1da6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1253,16 +1253,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				IOLog("A5XELTE FB: display-off after Power press\n");
+ 			}
+ #endif
++			bool changed = false;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				changed = true;
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 			/* (0330) the cores' rates follow it: bsd/dev/herolte_gpu.c, hg_power_thread */
+ 			herolte_screen_off_at = off ? mach_absolute_time() : 0;
++			if (changed) {
++				/* (0350) panel DCS off/sleep, GPU rate: bsd/dev/herolte_gpu.c */
++				extern void herolte_panel_power(bool on);
++				herolte_panel_power(!off);
++				if (!off) {
++					/* the panel is awake again: force one frame */
++					IOLockLock(fFB->fLock);
++					fFB->fDirty = true;
++					IOLockUnlock(fFB->fLock);
++				}
++			}
+ #endif
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
