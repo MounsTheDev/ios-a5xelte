@@ -21,10 +21,13 @@ backboardd, CoreAnimation, UIKit) tournent réellement, sur le vrai matériel.
 Conséquence directe : **tout ce qu'Apple attend d'un iPhone doit être réimplémenté
 pour ce SoC** — l'affichage, le GPU Mali (alors qu'iOS attend un PowerVR), le
 tactile, l'audio, le Wi-Fi, la batterie. C'est ce que fait ce dépôt, sous forme de
-**267 patchs noyau** et de plusieurs bibliothèques userspace.
+**275 patchs noyau** et de plusieurs bibliothèques userspace.
 
 Le port fonctionne : il démarre, affiche SpringBoard, lance des applications
-(iTunes Store, YouTube, Discord), se connecte au Wi-Fi, joue du son.
+(iTunes Store, YouTube, Discord), se connecte au Wi-Fi, joue du son. Les
+touches capacitives (multitâche/retour/LED), la veille OLED et les plafonds
+batterie sont validés ; le Bluetooth BCM4359 est en bring-up (Phase 1 `bt1`
+flashée, Phase 2 `bluetoothd` à faire).
 
 ---
 
@@ -54,8 +57,15 @@ Le port fonctionne : il démarre, affiche SpringBoard, lance des applications
 - Audio (HDA-like via I2S + codec), y compris les haptiques routées vers le moteur.
 - Batterie, capteurs de température, boutons physiques (Power/Volume/Home).
 - Applications installées et lançables.
-- **Extinction d'écran instantanée** (noir en un tick, plus de fondu).
-- CPU Mongoose à **2 600 MHz**, GPU à 650 MHz.
+- **Extinction d'écran instantanée** (noir en un tick, plus de fondu) et
+  veille OLED réelle : DCS `0x28`/`0x10` au verrouillage, `0x11`/`0x29` au
+  réveil, GPU 338 MHz écran éteint.
+- **Touches capacitives** : gauche = multitâche, droite = retour, LED 3 s ;
+  le faux appui `0x82` est filtré depuis `0352`.
+- **Batterie** : plafonds 1 976/546 MHz hors secteur, 1 976/419 MHz sous
+  3 550 mV ; chargeur lu en temps réel (`CHGIN_OK` + `CHGIN_DTLS`).
+- CPU Mongoose à **2 600 MHz** secteur / **1 976 MHz** batterie, GPU
+  650/546 MHz ; 728 MHz au repos.
 - Trois Gio de RAM utilisables.
 
 ## Ce qui ne marche pas / limites connues
@@ -64,10 +74,11 @@ Le port fonctionne : il démarre, affiche SpringBoard, lance des applications
   ~300 µs côté Mesa. Voir §11.
 - **Pas d'interruptions** : tout le noyau est en polling (§11.4).
 - USB non fonctionnel (endpoint 0 répond mais la configuration échoue).
-- Pas de DVFS : fréquences fixes.
-- Les touches capacitives latérales sont **inactives** dans l'interface
-  (chantier ouvert, §12) ; le contrôleur est désormais **lu et journalisé**
-  (étape 1 validée), l'injection reste à faire.
+- Pas de DVFS continu : des paliers fixes par profil (secteur/batterie), pas
+  d'ajustement fin selon la charge.
+- Bluetooth : le matériel `bt1` est flashé et la drop 17 installée ; les logs
+  `HEROLTE BT` sont à valider, et la pile iOS (`bluetoothd`, Phase 2) reste
+  à faire.
 - Le port est en mode développement : `debug=0xc`, pas de sécurité.
 
 ---
@@ -496,15 +507,19 @@ aucun geste n'est injecté.
   appui, `CMD_LED_OFF` (`0x20`) 3 s après le dernier.
 - **Front d'appui strict** : seuls les bits 0-3 sont suivis, et l'action
   part sur la transition vers `2` (appui), jamais sur la relâche ni sur la
-  relecture qui suit la désassertion de l'IRQ. Garde de 300 ms par touche.
+  relecture qui suit la désassertion de l'IRQ. Depuis `0352`, il faut **deux
+  échantillons propres identiques à 20 ms** (le `0x82` parasite est ignoré)
+  et la garde est passée à **500 ms**.
 - **ID** : 200 ms après la LDO, 3 essais par registre, cycle LDO off/on en
   dernier recours.
 
 Image : `build/xnu-boot-tk3.img`, sha256
 `09d5231c9030468d535377b2366f3e0d93fa9bd70b1afe7b09a505e6d5fa2321`
-(build `xnu` 43727793429, 12 min 58 s). Test sur téléphone : à faire.
+(build `xnu` 43727793429, 12 min 58 s). **Testé et validé** : multitâche à
+gauche, retour à droite, LED 3 s. Le correctif `0352` (image `fix1`) filtre
+ensuite le faux appui `0x82` et passe la garde à 500 ms.
 
-### Plan de travail recommandé
+### Plan de travail initial (conservé pour l'historique)
 
 1. **Étape 1 — lire, ne rien injecter.** I2C bit-bangé sur les deux broches,
    lecture du registre d'état, journalisation des appuis. Valide le matériel sans
@@ -824,6 +839,88 @@ Drop **génération 17** écrite et vérifiée (package
 `2593881052831856299`, 726 421 504 octets, 22 472 entrées) avec
 `bt/bcm4359.hcd` (59 702 octets) et les trois apps (PolySpeak, YouTube,
 Discord). **Deux redémarrages** pour l'installer.
+
+---
+
+## 22. Journal complet de la session — 15 novembre 2026
+
+### 22.1 Tout ce qui a été construit, dans l'ordre
+
+| # | Chantier | Patch | Build `xnu` | Image | sha256 (début) | Résultat |
+|---|---|---|---|---|---|---|
+| 1 | Touches, lecture | `0347` | 43723723649 | `tk1` | `ac9e96a4` | broches justes, **aucun ACK** : LDO16 coupée |
+| 2 | Touches, alimentation | `0348` | 43725950220 | `tk2` | `0297057c` | `LDO16 0x6c → 0xec`, touches `0x02/0x01/0x08/0x04` |
+| 3 | Touches, injection | `0349` | 43727793429 | `tk3` | `09d5231c` | multitâche à gauche, retour à droite, LED 3 s : **validés** |
+| 4 | Veille OLED + GPU | `0350` | 43733817607 | `pwr1` | `8efaa5de` | DCS `0x28/0x10/0x11/0x29`, GPU 338/650 |
+| 5 | Batterie, plafonds | `0351` | 43736632527 | `pwr2` | `4dd0d8d1` | 1 976/546 MHz batterie, 1 976/419 sous 3 550 mV |
+| 6 | Fantôme + charge | `0352` | 43739381894 | `fix1` | `c67cfdfb` | `0x82` filtré, `CHGIN_OK` lu ; la charge restait `ac` au débranchement |
+| 7 | Charge live | `0353` | 43743961070 | `bt1` | `b89f9cad` | `CHG_INT` + `CHGIN_OK` + `CHGIN_DTLS` live, aucun latch |
+| 8 | Bluetooth matériel | `0354` | 43743961070 | `bt1` | `b89f9cad` | UART1 `0x14C20000`, GPIO, HCI H4, `.hcd` |
+
+### 22.2 Les mesures qui ont compté
+
+- **tk1** : `gpe5 con=0x220000 dat=0xff pud=0x5005`, `gpa0 dat=0x3f`,
+  `id … 0000`, `no ACK at 0x20 sda=1 scl=1`. Le mux et les broches étaient
+  bons ; le contrôleur n'était pas alimenté.
+- **tk2** : `ldo16=0x6c` (3,3 V, bit 7 à 0) → `0xec` relu ; le MC96FT16xx
+  répond alors : gauche `0x02`/`0x01`, droite `0x08`/`0x04`, IRQ GPA0-0
+  à 0. Les `0x40`/`0x80` sont des drapeaux internes.
+- **tk3** : les gestes et la LED sont validés à l'usage.
+- **pwr1/pwr2** : les transitions veille/réveil et les plafonds batterie
+  sont en place ; l'usage a révélé deux régressions (voir ci-dessous).
+- **fix1** : le faux appui `0x82` ouvrait le multitâche tout seul ; la
+  lecture `CHGIN_OK` marchait au branchement mais restait bloquée à `ac`
+  au débranchement.
+- **bt1** : image flashée, drop 17 vérifiée ; les logs `HEROLTE BT` et le
+  test branchement/débranchement restent à faire.
+
+### 22.3 Images et sauvegardes
+
+| Image | sha256 | État |
+|---|---|---|
+| `build/SAFE-xnu-boot-tk3.img` | `09d5231c…` | sauvegarde touches validées |
+| `build/SAFE-xnu-boot-pwr1.img` | `8efaa5de…` | sauvegarde veille |
+| `build/SAFE-xnu-boot-pwr2.img` | `4dd0d8d1…` | sauvegarde plafonds batterie |
+| `build/SAFE-xnu-boot-fix1.img` | `c67cfdfb…` | sauvegarde fantôme/charge |
+| **`build/xnu-boot-bt1.img`** | **`b89f9cad…`** | **courante, flashée** |
+
+### 22.4 Index des patches
+
+| Patch | Fichiers | Rôle |
+|---|---|---|
+| `0347-herolte-touchkey-read` | `herolte_touchkey.c` (nouveau), `conf/files`, `IOKitBSDInit.cpp` | lecture ABOV, bit-bang GPE5-2/3 |
+| `0348-herolte-touchkey-power` | `herolte_touchkey.c` | S2MPB02 LDO16, HSI2C9 |
+| `0349-herolte-touchkey-inject` | `herolte_touchkey.c` | double Home, swipe retour, LED |
+| `0350-herolte-power-sleep` | `herolte_gpu.c`, `SweetFramebuffer.cpp` | DCS OLED, GPU 338/650, réveil CPU |
+| `0351-herolte-battery-brownout-guard` | `herolte_gpu.c`, `herolte_battery.c` | plafonds batterie, `hc_go_rate` |
+| `0352-herolte-ghost-touch-and-charger` | `herolte_touchkey.c`, `herolte_battery.c`, `herolte_gpu.c`, `SweetBattery.cpp` | filtre `0x82`, `CHGIN_OK` |
+| `0353-herolte-plug-live` | `herolte_battery.c`, `herolte_gpu.c`, `SweetBattery.cpp` | charge live `0xB0/0xB2/0xB3` |
+| `0354-herolte-bt-hw` | `herolte_bt.c` (nouveau), `conf/files`, `IOKitBSDInit.cpp` | BCM4359 UART1/GPIO/HCI/.hcd |
+
+### 22.5 État exact à la passation
+
+- Image courante : **`bt1`** (`b89f9cad…`), flashée sur `sda5`, relecture
+  identique.
+- Drop **génération 17** vérifiée : 726 421 504 octets, 22 472 entrées,
+  `bt/bcm4359.hcd` 59 702 octets, apps PolySpeak/YouTube/Discord.
+- Premier boot effectué ; le **second boot**, le test branchement/
+  débranchement et la lecture des logs `HEROLTE BT`/`HEROLTE PWR` restent
+  à faire.
+- Le correctif charge live (`0353`) est **dans** `bt1`.
+- La Phase 2 Bluetooth (`bluetoothd`) n'est **pas** commencée.
+
+### 22.6 Prochaines étapes
+
+1. Second boot, test câble, retour TWRP : vérifier
+   `HEROLTE BT: reset ok=1`, `fw bytes=59702`, `bdaddr=…`, et
+   `HEROLTE PWR: plug=1` → `plug=0`.
+2. Si `reset ok=0` : activer l'horloge CMU de l'UART1 (le log
+   `uart as found` dira si les registres sont muets). Si `fw bytes=0` :
+   vérifier `HEROLTE DROP: package 17`.
+3. Phase 2 : exposer `IOBluetoothHCIController`/`IOSerialBSDClient` et
+   `/dev/herobt` (H4 complet), retirer `bluetoothd` de `heronoexec` en
+   restant sous **608 octets**, puis tester l'interrupteur
+   Réglages → Bluetooth et le scan.
 
 ---
 
