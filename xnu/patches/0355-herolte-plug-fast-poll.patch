@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..7a94bfd 100644
+index f08a35c..594e56e 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -26,7 +26,39 @@ index f08a35c..7a94bfd 100644
  #define HSI2C_CONF      0x40
  #define HSI2C_AUTO_CONF 0x44
  #define HSI2C_TIMEOUT   0x48
-@@ -216,27 +226,196 @@ herolte_fg_init(void)
+@@ -164,6 +174,31 @@ fg_message(bool receive, uint8_t *bytes, unsigned count, bool stop)
+ 	return fg_message_at(FG_ADDR, receive, bytes, count, stop);
+ }
+ 
++/*
++ * (0363) One byte, for the 8-bit peripherals.
++ *
++ * The gauge at 0x36 is a 16-bit device: a read of register n returns n and
++ * n+1, which is why fg_word_at() asks for two bytes.  The MFD half of the
++ * same chip (0x66) and the PMIC s2mps16 (0x66 on the other bus) are 8-bit
++ * maps, and asking them for two bytes leaves the controller clocking a byte
++ * that was never sent, so the FIFO hands back 0xff for everything that
++ * follows.  This asks for exactly one byte and is what those two use now.
++ */
++static bool
++fg_byte_at(uint8_t addr, uint8_t reg, uint8_t *value)
++{
++	uint8_t b = 0;
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (fg_message_at(addr, false, &reg, 1, false) &&
++		    fg_message_at(addr, true, &b, 1, true)) {
++			*value = b;
++			return true;
++		}
++		delay(500);
++	}
++	return false;
++}
++
+ static bool
+ fg_word_at(uint8_t addr, uint8_t reg, uint16_t *value)
+ {
+@@ -216,27 +251,215 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -66,12 +98,12 @@ index f08a35c..7a94bfd 100644
 +	if (!fg_i2c) {
 +		return -1;
 +	}
-+	uint16_t chg = 0, dtls = 0;
-+	bool chg_ok = fg_word_at(0x66, 0xB2, &chg);
-+	bool dtls_ok = fg_word_at(0x66, 0xB3, &dtls);
++	uint8_t chg = 0, dtls = 0;
++	bool chg_ok = fg_byte_at(0x66, 0xB2, &chg);
++	bool dtls_ok = fg_byte_at(0x66, 0xB3, &dtls);
 +	herolte_fg_ac_valid = chg_ok;
-+	herolte_fg_ac_raw = chg & 0xff;
-+	herolte_fg_dtls = dtls & 0xff;
++	herolte_fg_ac_raw = chg;
++	herolte_fg_dtls = dtls;
 +	/*
 +	 * (0358) 0xFF is not a charger state, it is a bus that answered nothing:
 +	 * an unanswered read leaves SDA released, so the FIFO yields all ones and
@@ -82,13 +114,33 @@ index f08a35c..7a94bfd 100644
 +	 * a failed read was already "no cable".  Only 0x40 and 0x60 in their bytes
 +	 * ever mean a cable, and those single bits are what the chip drives.
 +	 */
-+	bool chg_dead = !chg_ok || (chg & 0xff) == 0xff;
-+	bool dtls_dead = !dtls_ok || (dtls & 0xff) == 0xff;
++	bool chg_dead = !chg_ok || chg == 0xff;
++	bool dtls_dead = !dtls_ok || dtls == 0xff;
 +	if (chg_dead) {
-+		herolte_fg_ac_valid = 0;
-+		herolte_fg_ac = 0;
-+		return -1;
-+	}
++		/*
++		 * (0364) The MFD half is unreadable.  Reach the cable through the
++		 * two halves that do answer on this board: the MUIC's VBUS flag and
++		 * the gauge's current.  TWRP, with Android's charger driver bound,
++		 * reads online=3 / current_now=1000 on the same chip, so the
++		 * hardware can report this; only our route to 0x66 is broken.
++		 *
++		 * Neither half is trusted alone: 0xB7 is the MUIC's VBUS bit in
++		 * Samsung's max77854 layout, and a positive current is what a
++		 * charging battery shows.  VBUS alone keeps the bolt honest while
++		 * the current decides charging, and both stay logged raw above.
++		 */
++		uint8_t muic = 0;
++		bool muic_ok = fg_byte_at(0x66, 0xB7, &muic);
++		bool vbus = muic_ok && (muic & 0x40) && muic != 0xff;
++		if (!muic_ok || muic == 0xff) {
++			herolte_fg_ac_valid = 0;
++			herolte_fg_ac = 0;
++			return -1;
++		}
++		herolte_fg_ac_valid = 1;
++		herolte_fg_ac = vbus ? 1 : 0;
++		return 0;
+ 	}
 +	herolte_fg_ac = (chg & 0x40) && !dtls_dead && ((dtls & 0x60) != 0);
 +	return (dtls_dead && (chg & 0x40)) ? -1 : 0;
 +}
@@ -118,9 +170,9 @@ index f08a35c..7a94bfd 100644
 +	}
 +	printf("HEROLTE FG: ---- dump (%s) ----\n", why);
 +	for (unsigned i = 0; i < 8; i++) {
-+		uint16_t v = 0;
-+		bool ok = fg_word_at(0x66, (uint8_t)(0xB0 + i), &v);
-+		printf("HEROLTE FG: 0x66:0x%02x %-5s = %#04x (%s)\n",
++		uint8_t v = 0;
++		bool ok = fg_byte_at(0x66, (uint8_t)(0xB0 + i), &v);
++		printf("HEROLTE FG: 0x66:0x%02x %-5s = %#02x (%s)\n",
 +		    0xB0 + i, names[i], (unsigned)v, ok ? "answered" : "no answer");
 +	}
 +	/*
@@ -128,9 +180,9 @@ index f08a35c..7a94bfd 100644
 +	 * flips with the cable can live below 0xB0, and this costs one boot.
 +	 */
 +	for (unsigned i = 0; i < 0x20; i++) {
-+		uint16_t v = 0;
-+		bool ok = fg_word_at(0x66, (uint8_t)i, &v);
-+		printf("HEROLTE FG: 0x66:0x%02x = %#04x (%s)\n", i, (unsigned)v,
++		uint8_t v = 0;
++		bool ok = fg_byte_at(0x66, (uint8_t)i, &v);
++		printf("HEROLTE FG: 0x66:0x%02x = %#02x (%s)\n", i, (unsigned)v,
 +		    ok ? "answered" : "no answer");
 +	}
 +	/* The gauge half of the same chip, which is known to answer. */
@@ -193,9 +245,9 @@ index f08a35c..7a94bfd 100644
 +
 +	if (!pmic_i2c) {
 +		return -1;
- 	}
++	}
 +	if (!fg_message_at(PMIC_ADDR, false, &reg, 1, false) ||
-+	    !fg_message_at(PMIC_ADDR, true, b, 2, true)) {
++	    !fg_message_at(PMIC_ADDR, true, b, 1, true)) {
 +		return -1;
 +	}
 +	*value = b[0];
@@ -218,16 +270,15 @@ index f08a35c..7a94bfd 100644
 +unsigned
 +herolte_fg_charger_digest(void)
 +{
-+	uint16_t b0 = 0, b2 = 0, b3 = 0;
++	uint8_t b0 = 0, b2 = 0, b3 = 0;
 +
 +	if (!fg_i2c) {
 +		return 0;
 +	}
-+	(void)fg_word_at(0x66, 0xB0, &b0);
-+	(void)fg_word_at(0x66, 0xB2, &b2);
-+	(void)fg_word_at(0x66, 0xB3, &b3);
-+	return ((unsigned)(b0 & 0xff) << 16) | ((unsigned)(b2 & 0xff) << 8) |
-+	    (unsigned)(b3 & 0xff);
++	(void)fg_byte_at(0x66, 0xB0, &b0);
++	(void)fg_byte_at(0x66, 0xB2, &b2);
++	(void)fg_byte_at(0x66, 0xB3, &b3);
++	return ((unsigned)b0 << 16) | ((unsigned)b2 << 8) | (unsigned)b3;
 +}
 +
 +int

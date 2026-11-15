@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..ccf60ad 100644
+index 26fefa3..dd1da01 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
 @@ -61,6 +61,39 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
@@ -42,7 +42,7 @@ index 26fefa3..ccf60ad 100644
  static uint32_t
  bt_rd(vm_offset_t base, uint32_t off)
  {
-@@ -113,6 +146,157 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
+@@ -113,6 +146,158 @@ bt_gpio_out(vm_offset_t base, uint32_t con, uint32_t dat, uint32_t pud, unsigned
  	bt_wr(base, dat, v);
  }
  
@@ -98,8 +98,9 @@ index 26fefa3..ccf60ad 100644
 +	}
 +	ldo_ok = herolte_pmic_rd(PMIC_LDO28_CTRL, &ldo);
 +	clk_ok = herolte_pmic_rd(PMIC_32K_CTRL, &clk);
-+	BT_LOG("HEROLTE BT: pmic ldo28=%#x%s 32k=%#x%s (before)",
-+	    ldo, ldo_ok == 0 ? "" : "?", clk, clk_ok == 0 ? "" : "?");
++	BT_LOG("HEROLTE BT: pmic ldo28=%#x%s 32k=%#x%s (before%s)",
++	    ldo, ldo_ok == 0 ? "" : "?", clk, clk_ok == 0 ? "" : "?",
++	    (ldo == 0xff && clk == 0xff) ? ", bus silent" : "");
 +	if (ldo_ok == 0 && !(ldo & PMIC_LDO28_ON)) {
 +		(void)herolte_pmic_wr(PMIC_LDO28_CTRL, (uint8_t)(ldo | PMIC_LDO28_ON));
 +		BT_LOG("HEROLTE BT: ldo28 was off, set on");
@@ -200,7 +201,7 @@ index 26fefa3..ccf60ad 100644
  static bool
  bt_tx_byte(uint8_t b)
  {
-@@ -249,7 +433,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -249,7 +434,6 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	uint8_t reply[64];
  	uint8_t rlen;
@@ -208,7 +209,7 @@ index 26fefa3..ccf60ad 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,38 +449,53 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,38 +450,53 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
