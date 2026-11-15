@@ -242,7 +242,7 @@ index 961f7e3..85319c9 100644
  		if (off != 0 && now > off) {
  			absolutetime_to_nanoseconds(now - off, &ns);
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index eba2cd8..97c1da6 100644
+index eba2cd8..32d4422 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -1253,16 +1253,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
@@ -263,7 +263,7 @@ index eba2cd8..97c1da6 100644
  			herolte_screen_off_at = off ? mach_absolute_time() : 0;
 +			if (changed) {
 +				/* (0350) panel DCS off/sleep, GPU rate: bsd/dev/herolte_gpu.c */
-+				extern void herolte_panel_power(bool on);
++				extern "C" void herolte_panel_power(bool on);
 +				herolte_panel_power(!off);
 +				if (!off) {
 +					/* the panel is awake again: force one frame */
