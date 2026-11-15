@@ -65,7 +65,9 @@ Le port fonctionne : il démarre, affiche SpringBoard, lance des applications
 - **Pas d'interruptions** : tout le noyau est en polling (§11.4).
 - USB non fonctionnel (endpoint 0 répond mais la configuration échoue).
 - Pas de DVFS : fréquences fixes.
-- Les touches capacitives latérales sont **inactives** (chantier ouvert, §12).
+- Les touches capacitives latérales sont **inactives** dans l'interface
+  (chantier ouvert, §12) ; le contrôleur est désormais **lu et journalisé**
+  (étape 1 validée), l'injection reste à faire.
 - Le port est en mode développement : `debug=0xc`, pas de sécurité.
 
 ---
@@ -451,11 +453,38 @@ muxe GPE5-2/3 en GPIO, bit-bang à ~160 kHz, lit `0x00`/`0x01`/`0x02`/`0x14`
 et journalise les appuis. Il ne pilote que les deux lignes du bus ; aucun
 geste, aucun registre du contrôleur n'est écrit, pas de rétroéclairage.
 
-Image de l'étape 1 : `build/xnu-boot-tk1.img`, sha256
-`ac9e96a4073a343a422b270bbddd39a52074a813046b6360319c90019e80d414`
-(build `xnu` 43723723649, 14 min 06 s, aucun patch sauté). Vérifiée par
-`herolte-verify-boot.py` : 0 fallos. Le noyau contient le symbole
-`_herolte_touchkey_probe` et les chaînes `HEROLTE TK`.
+Image de l'étape 1 : `build/xnu-boot-tk2.img`, sha256
+`0297057c136e18aaff3dd6584b8e110654e77a94ffca3b2e0abce41b0b79f296`
+(build `xnu` 43725950220, 11 min 18 s, aucun patch sauté). Vérifiée par
+`herolte-verify-boot.py` : 0 fallos.
+
+### Étape 1 — résultat mesuré (15 novembre 2026)
+
+Premier boot (patch `0347`, lecture seule) : `gpe5 con=0x220000 dat=0xff
+pud=0x5005`, `gpa0 dat=0x3f`, **aucun ACK** à `0x20`, IRQ jamais assertée.
+Les broches et le mux étaient corrects ; le contrôleur n'était pas alimenté.
+
+Le `TOUCH_VDD_3.3V` est bien **S2MPB02 LDO16** sur HSI2C9 `0x13680000`
+(GPD1-4/5, fonction 2). Le noyau XNU n'a pas de régulateur : la LDO était
+restée **coupée** (`L16CTRL=0x6c`, 3,3 V mais bit 7 à 0). Le patch `0348`
+lit l'ID du S2MPB02, puis `0x2d`, et écrit `0xec` si besoin.
+
+Deuxième boot : `ldo16=0x6c` → `0xec` relu, et le contrôleur répond :
+
+```
+gauche : raw=0x2 (appui) puis 0x1 (relâche)
+droite : raw=0x8 (appui) puis 0x4 (relâche)
+IRQ GPA0-0 : passe à 0 sur l'événement, revient à 1 après lecture
+```
+
+Les valeurs `0x40`/`0x80` sont des drapeaux internes du MC96FT16xx (le
+pilote Linux les ignore) ; seuls les bits 1:0 et 3:2 portent les touches.
+L'ID (`0x01`/`0x02`/`0x14`) est encore lu `0000` au premier essai : le
+chip démarre après l'activation de la LDO, il faut **200 ms + retries**
+avant la première lecture. Le reste de la chaîne est validé.
+
+**Étape 1 terminée.** Le contrôleur est lu, les appuis sont journalisés,
+aucun geste n'est injecté.
 
 ### Plan de travail recommandé
 
