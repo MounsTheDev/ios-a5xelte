@@ -815,7 +815,15 @@ GPU 338/650) + pwr2 (plafonds batterie, anti-UVLO, jauge lissée), image
 
 ### Image bt1
 
-À compléter après le build.
+`build/xnu-boot-bt1.img`, sha256
+`b89f9cadc184abd678b7aaf8eb289639f24b9735d1049cf1c5823f7c5c4569c0`
+(build `xnu` 43743961070, 14 min 04 s, aucun patch sauté ; 0 fallos).
+Flashée sur `sda5`, relecture identique.
+
+Drop **génération 17** écrite et vérifiée (package
+`2593881052831856299`, 726 421 504 octets, 22 472 entrées) avec
+`bt/bcm4359.hcd` (59 702 octets) et les trois apps (PolySpeak, YouTube,
+Discord). **Deux redémarrages** pour l'installer.
 
 ---
 
