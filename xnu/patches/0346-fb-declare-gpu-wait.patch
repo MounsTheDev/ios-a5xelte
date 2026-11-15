@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4a72524..eba2cd8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -365,6 +365,14 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 		IOLog("HEROLTE FB: timer coalescing %s; CoreAnimation told %u Hz\n", mach_timer_coalescing_enabled ? "on" : "off",
+ 		    refresh != NULL ? told : 0);
++		/*
++		 * The GL bridge finishes a frame itself unless the display says it waits for the GPU ("HakiosWaitsForGPU",
++		 * gpu/hakios-gl/src/eagl.c: display_waits()). This driver does: present() submits the panel blit and waits
++		 * for it, and GPU jobs run in order, so by the time the blit is done every draw it covers is done too. Left
++		 * unpublished, the bridge did a full glFinish() before handing each frame over -- 4 ms of the 16.8 ms a
++		 * frame costs here, on a 16.7 ms budget.
++		 */
++		setProperty("HakiosWaitsForGPU", kOSBooleanTrue);
+ 	}
+ #endif
+ 	uint32_t hz = 10;
