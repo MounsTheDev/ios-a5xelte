@@ -680,7 +680,10 @@ python3 tools/herolte-log-pull.py adb build/boot.txt
 
 ### Image
 
-`build/xnu-boot-pwr1.img`, sha256 à compléter après le build `43730604193`.
+`build/xnu-boot-pwr1.img`, sha256
+`8efaa5de88391b7aafab030d5b12b55dbfd63c6944fab2491b501e9a63994304`
+(build `xnu` 43733817607, 19 min 53 s, aucun patch sauté ; vérifiée par
+`herolte-verify-boot.py` : 0 fallos).
 
 ### Test
 
