@@ -1,0 +1,124 @@
+name: ios-clock
+
+# Extract ONLY /Applications/MobileTimer.app (the real iOS 16 arm64 Clock) from
+# the donor IPSW and publish it as a workflow artifact, so it can be delivered
+# through the herolte drop zone instead of restaging the whole iOS root.
+# The bundle is Apple software: the job refuses to run in a public repository.
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_device:
+        description: ipsw.me identifier of the userland source
+        default: "iPhone10,3"
+      ios_version:
+        description: iOS version
+        default: "16.7.16"
+
+permissions:
+  contents: read
+
+jobs:
+  clock:
+    if: github.event.repository.private == true
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (Xcode and simulators are not needed)
+        run: |
+          df -h /
+          sudo rm -rf /Applications/Xcode*.app /Library/Developer/CoreSimulator \
+            ~/Library/Developer/CoreSimulator /Users/runner/Library/Android || true
+          df -h /
+
+      - name: Fetch the OS disk image and the app cryptex
+        run: |
+          set -euo pipefail
+          url=$(curl -sf "https://api.ipsw.me/v4/device/${{ inputs.ipsw_device }}?type=ipsw" | python3 -c "
+          import json, sys
+          fw = [f for f in json.load(sys.stdin)['firmwares'] if f['version'] == '${{ inputs.ios_version }}']
+          print(fw[0]['url'])")
+          echo "IPSW: $url"
+          mkdir -p ipsw
+          python3 tools/remotezip.py "$url" BuildManifest.plist ipsw
+          python3 - ipsw/BuildManifest.plist > members.txt <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], 'rb'))
+          ident = next(i for i in m['BuildIdentities']
+                       if i['Info']['DeviceClass'].lower() == 'd22ap'
+                       and 'Erase' in i['Info'].get('Variant', ''))
+          want = {'OS': 'os', 'Cryptex1,SystemOS': 'systemos', 'Cryptex1,AppOS': 'appos'}
+          for name, short in want.items():
+              info = ident['Manifest'][name]['Info']
+              print(f"{info['Path']} {short}.{info['Path'].rsplit('.', 1)[-1]}")
+          PY
+          cat members.txt
+          while read -r path name; do
+            python3 tools/remotezip.py "$url" "$path" ipsw
+            mv "ipsw/$path" "ipsw/$name"
+          done < members.txt
+          ls -la ipsw
+
+      - name: Mount the images
+        run: |
+          set -euo pipefail
+          attach() { hdiutil attach -nobrowse -readonly -owners on "$1" | awk -F'\t' '/\/Volumes\// {print $NF}' | tail -1; }
+          os=$(attach ipsw/os.dmg)
+          app=$(attach ipsw/appos.dmg)
+          echo "OS=$os" >> "$GITHUB_ENV"
+          echo "APP=$app" >> "$GITHUB_ENV"
+          echo "OS root: $os"
+          ls "$os/Applications" | head -20
+          echo "App cryptex: $app"
+          ls "$app" 2>/dev/null | head
+
+      - name: Locate MobileTimer.app and ClockAngel.app
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          found=0
+          for root in "$OS" "$APP"; do
+            [ -d "$root" ] || continue
+            for name in MobileTimer ClockAngel; do
+              src=$(find "$root" -maxdepth 6 -type d -name "$name.app" -print -quit 2>/dev/null || true)
+              if [ -n "$src" ]; then
+                echo "found $name.app at $src"
+                cp -a "$src" "out/$name.app"
+                found=1
+              fi
+            done
+          done
+          [ "$found" = 1 ] || { echo "no Clock bundle found in the images"; exit 1; }
+          ls -la out
+
+      - name: Verify arm64 and report the identity
+        run: |
+          set -euo pipefail
+          for app in out/*.app; do
+            echo "=== $app"
+            exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist" || true
+            file "$app/$exe"
+            lipo -archs "$app/$exe" || true
+            lipo -archs "$app/$exe" | grep -qw arm64 || {
+              echo "$app/$exe has no arm64 slice"; exit 1; }
+            codesign -d --entitlements - "$app" > "$app.entitlements.txt" 2>/dev/null || true
+            head -40 "$app.entitlements.txt" || true
+          done
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd out
+          tar czf ../MobileTimer.tgz .
+          cd ..
+          ls -l MobileTimer.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MobileTimer
+          path: MobileTimer.tgz
+          if-no-files-found: error
+          retention-days: 7
