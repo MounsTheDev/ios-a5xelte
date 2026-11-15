@@ -743,13 +743,17 @@ le réveil instantané.
 
 ### Image
 
-`build/xnu-boot-pwr2.img`, sha256 à compléter (build `43736632527`).
+`build/xnu-boot-pwr2.img`, sha256
+`4dd0d8d100cd6255cc1adfb2aeeb24ed858a230a8646429a9529ea020e9f978c`
+(build `xnu` 43736632527, 15 min 41 s, aucun patch sauté ; vérifiée par
+`herolte-verify-boot.py` : 0 fallos).
 
 ### Chantier 1
 
-**Terminé** : pwr1 (DCS `0x28`/`0x10`/`0x11`/`0x29`, GPU 338/650) + pwr2
-(plafonds batterie, anti-UVLO, jauge lissée). Validation sur téléphone à
-faire après le flash.
+**Terminé et validé sur banc** : pwr1 (DCS `0x28`/`0x10`/`0x11`/`0x29`,
+GPU 338/650) + pwr2 (plafonds batterie, anti-UVLO, jauge lissée), image
+`xnu-boot-pwr2.img` vérifiée à 0 fallos. La validation sur téléphone
+(flash + cycles secteur/batterie) reste la dernière étape.
 
 ---
 
