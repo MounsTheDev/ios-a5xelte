@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_bt.c b/bsd/dev/herolte_bt.c
-index 26fefa3..f7bb7fd 100644
+index 26fefa3..16ab92c 100644
 --- a/bsd/dev/herolte_bt.c
 +++ b/bsd/dev/herolte_bt.c
 @@ -61,6 +61,23 @@ static vm_offset_t bt_uart, bt_peric1, bt_fsys0, bt_alive;
@@ -156,19 +156,47 @@ index 26fefa3..f7bb7fd 100644
  	unsigned events = 0;
  
  	/* The rootfs and the drop zone are up by then. */
-@@ -266,38 +397,25 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -266,38 +397,52 @@ bt_thread(__unused void *arg, __unused wait_result_t wr)
  	bt_wr(bt_peric1, 0x00, (bt_rd(bt_peric1, 0x00) & ~0xffffu) | 0x2222u);
  	bt_wr(bt_peric1, 0x08, (bt_rd(bt_peric1, 0x08) & ~0xffu) | 0xffu);
  	bt_wr(bt_peric1, 0x0c, (bt_rd(bt_peric1, 0x0c) & ~0xffu) | 0xffu);
 -	/* BT_REG_ON low, BT_WAKE high, BT_REG_ON high, 150 ms. */
+-	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
+-	bt_msleep(20);
+-	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
+-	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
+-	bt_msleep(150);
 +	/* (0356) The block's own clock, before anything is written to it. */
 +	bt_uart_clock();
-+	/* BT_REG_ON low, BT_WAKE high, pause, BT_REG_ON high. */
- 	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);
- 	bt_msleep(20);
- 	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);
- 	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);
--	bt_msleep(150);
++	/*
++	 * (0359) The devicetree is the authority on these three pins, and bt1 to
++	 * bt3 never consulted it:
++	 *
++	 *   pinctrl@14CC0000/bt-en        samsung,pins "gpj1-7"  function 1
++	 *   pinctrl@10E60000/bt-btwake    samsung,pins "gpi2-3"  function 1
++	 *   pinctrl@10580000/bt-hostwake  samsung,pins "gpa2-3"  input
++	 *
++	 * bt-en lives in the GPJ1 bank at PERIC1 +0x60, and the blanket write
++	 * above (0x2222 into PERIC1 +0x00) puts whole GPJ banks on function 2
++	 * for the UART before bt-en is ever configured.  A pin on the wrong
++	 * function shows its output latch in DAT while the pad drives nothing,
++	 * which is exactly the pair bt3 logged: reg_on=1 with host_wake=0.  So
++	 * bt-en is set to function 1 (output) with a pull-down after that
++	 * blanket write, and the order is the one the BCM4359 asks for:
++	 * BT_WAKE high first, then BT_REG_ON released, then a settle long
++	 * enough for the chip's ROM to come up and drive HOST_WAKE.
++	 */
++	bt_pin_fn(bt_peric1, 0x00, 7, 1);                       /* GPJ1-7 bt-en: output */
++	bt_pin_pud(bt_peric1, 0x08, 7, 1);                      /* pull-down */
++	bt_pin_fn(bt_fsys0, 0x00, 3, 1);                        /* GPI2-3 bt-wake */
++	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 0);         /* BT_REG_ON low */
++	bt_gpio_out(bt_fsys0, 0x20, 0x24, 0x28, 3, 1);          /* BT_WAKE high */
++	bt_msleep(50);
++	bt_gpio_out(bt_peric1, 0x60, 0x64, 0x68, 7, 1);         /* BT_REG_ON high */
++	/* The pad levels, not only the latches, before the chip is asked. */
++	BT_LOG("HEROLTE BT: bt-en con=%#x dat=%#x pud=%#x; bt-wake con=%#x dat=%#x",
++	    bt_rd(bt_peric1, 0x00), bt_rd(bt_peric1, 0x60), bt_rd(bt_peric1, 0x08),
++	    bt_rd(bt_fsys0, 0x00), bt_rd(bt_fsys0, 0x20));
 +	/*
 +	 * (0356) Wait for the chip's own sign of life instead of a fixed sleep:
 +	 * BT_HOST_WAKE is driven low while it boots.  In bt1 the line read 0 just
@@ -201,9 +229,12 @@ index 26fefa3..f7bb7fd 100644
 -	}
 -	bt_wr(bt_uart, UART_UBRDIV, ubrdiv);
 -	bt_wr(bt_uart, UART_UFRACVAL, ufrac);
++	/* The chip's own boot time, before HOST_WAKE is expected. */
++	bt_msleep(150);
 +	int woke = bt_wait_host_wake(1500);
-+	BT_LOG("HEROLTE BT: uart=0x%x reg_on=1 wake=1 host_wake=%d waited=%d ms",
-+	    BT_UART_PA, bt_host_wake(), woke);
++	BT_LOG("HEROLTE BT: uart=0x%x reg_on=%d wake=%d host_wake=%d waited=%d ms",
++	    BT_UART_PA, (int)((bt_rd(bt_peric1, 0x64) >> 7) & 1u),
++	    (int)((bt_rd(bt_fsys0, 0x24) >> 3) & 1u), bt_host_wake(), woke);
 +	/* (0356) 8N1 115200 from a known clock. */
 +	bt_uart_conf();
  	bt_msleep(10);

@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
-index f08a35c..2f5c07a 100644
+index f08a35c..2620387 100644
 --- a/bsd/dev/herolte_battery.c
 +++ b/bsd/dev/herolte_battery.c
 @@ -18,6 +18,7 @@
@@ -10,7 +10,7 @@ index f08a35c..2f5c07a 100644
  
  #define FG_HSI2C_PA     0x13650000u
  #define FG_PINS_PA      0x136d0000u     /* GPI0 +0x00, GPD0 +0x20, GPD1 +0x40 */
-@@ -216,27 +217,59 @@ herolte_fg_init(void)
+@@ -216,27 +217,97 @@ herolte_fg_init(void)
  	return 0;
  }
  
@@ -49,7 +49,7 @@ index f08a35c..2f5c07a 100644
 -		herolte_fg_ac = chg_ok && (chg & 0x40) && (dtls_ok ? ((dtls & 0x60) != 0) : 1);
 +	if (!fg_i2c) {
 +		return -1;
- 	}
++	}
 +	uint16_t chg = 0, dtls = 0;
 +	bool chg_ok = fg_word_at(0x66, 0xB2, &chg);
 +	bool dtls_ok = fg_word_at(0x66, 0xB3, &dtls);
@@ -77,6 +77,44 @@ index f08a35c..2f5c07a 100644
 +	return (dtls_dead && (chg & 0x40)) ? -1 : 0;
 +}
 +
++/*
++ * (0360) Which charger register actually answers on this board.
++ *
++ * The TWRP devicetree has one node, max77854@66, and a running Android
++ * exposes exactly one bound driver, 1-0066 max77854, whose power_supply
++ * reports online=3, present=1, current_now=1000, status=Charging with the
++ * cable in.  So 0x66 is the right address and 0xB2/0xB3 are the wrong
++ * registers: both come back 0xff whether the cable is in or out.  1-0069
++ * exists but is bound to the dummy driver, so the charger block is not
++ * there either.  This dump prints the whole status window once, so a single
++ * journal says which offset carries CHGIN.
++ */
++void
++herolte_fg_dump_charger(void)
++{
++	static const char *names[] = {
++		"B0 int", "B1 int2", "B2 ok", "B3 dtls", "B4", "B5", "B6", "B7"
++	};
++
++	if (!fg_i2c) {
++		printf("HEROLTE FG: no i2c for the charger dump\n");
++		return;
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		uint16_t v = 0;
++		bool ok = fg_word_at(0x66, (uint8_t)(0xB0 + i), &v);
++		printf("HEROLTE FG: 0x%02x %-7s = %#04x (%s)\n", 0xB0 + i,
++		    names[i], (unsigned)v, ok ? "answered" : "no answer");
++	}
++	/* The other address the port has a device node for, for the record. */
++	for (unsigned i = 0; i < 4; i++) {
++		uint16_t v = 0;
++		bool ok = fg_word_at(0x69, (uint8_t)(0xB0 + i), &v);
++		printf("HEROLTE FG: 0x69:0x%02x = %#04x (%s)\n", 0xB0 + i,
++		    (unsigned)v, ok ? "answered" : "no answer");
+ 	}
++}
++
 +int
 +herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah)
 +{
@@ -87,19 +125,21 @@ index f08a35c..2f5c07a 100644
  	    !fg_word(FG_CURRENT, &current) || !fg_word(FG_REPCAP, &rem) ||
  	    !fg_word(FG_FULLCAP, &full)) {
 diff --git a/bsd/dev/herolte_gpu.c b/bsd/dev/herolte_gpu.c
-index 5fe437a..ff546db 100644
+index 5fe437a..eb762d8 100644
 --- a/bsd/dev/herolte_gpu.c
 +++ b/bsd/dev/herolte_gpu.c
-@@ -30,6 +30,8 @@ extern volatile int herolte_fg_ac;       /* MAX77854 CHGIN_OK */
+@@ -30,6 +30,10 @@ extern volatile int herolte_fg_ac;       /* MAX77854 CHGIN_OK */
  extern volatile int herolte_fg_ac_valid;
  extern volatile int herolte_fg_ac_raw;
  extern volatile int herolte_fg_dtls;
 +/* (0355) Two register reads on the charger MFD, for the plug-edge wake-up. */
 +extern int herolte_fg_charger(void);
++/* (0360) One register map at each cable edge: which offset answers. */
++extern void herolte_fg_dump_charger(void);
  void herolte_gpu_probe(void);
  /* GPU present, for iokit/Kernel/arm/SweetFramebuffer.cpp. */
  int herolte_gpu_present_slot(uint32_t id, uint64_t first_pa);
-@@ -72,6 +74,17 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
+@@ -72,6 +76,17 @@ uint32_t herolte_gpu_submit(unsigned js, uint64_t jc, uint64_t *us);
  static int hg_sleep;
  static int hg_pwr_sleep;
  
@@ -117,7 +157,7 @@ index 5fe437a..ff546db 100644
  static uint32_t
  hg_rd(vm_offset_t base, uint32_t off)
  {
-@@ -2617,6 +2630,25 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -2617,6 +2632,26 @@ hg_power_thread(__unused void *arg, __unused wait_result_t wr)
  		unsigned mv = herolte_fg_mv;
  		/* Live charger state: no latch, battery on any failed read. */
  		bool ac = herolte_fg_ac_valid && herolte_fg_ac != 0;
@@ -139,6 +179,7 @@ index 5fe437a..ff546db 100644
 +			    ac ? 1 : 0, ac ? "in" : "out",
 +			    (unsigned)herolte_fg_ac_raw, (unsigned)herolte_fg_dtls, mv,
 +			    (herolte_fg_ac_raw & 0xff) == 0xff ? " (no ack)" : "");
++			herolte_fg_dump_charger();
 +		}
  		if (mv != 0 && mv != last_mv) {
  			/* The gauge updates about once a second; five distinct samples. */
