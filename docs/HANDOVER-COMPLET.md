@@ -5,7 +5,12 @@ Il contient : ce qu'est le projet, comment il se construit, comment il s'install
 comment il se mesure, ce qui marche, ce qui ne marche pas, et **tous les pièges
 rencontrés** avec leurs symptômes exacts.
 
-Dernière mise à jour : 15 novembre 2026, fin de session.
+Dernière mise à jour : 16 novembre 2026, fin de phase (développement en pause
+jusqu'aux vacances de décembre 2026 ; le téléphone est repassé sous Android).
+
+> **Reprise rapide :** lire d'abord [HEROLTE-PROGRESS.md](HEROLTE-PROGRESS.md)
+> (une page, anglais + résumé français) : ce qui marche, ce qui reste, et les
+> sept règles à ne pas réapprendre. Le présent document est le détail complet.
 
 ---
 
@@ -1015,4 +1020,48 @@ est définitif : ne plus hooker SpringBoard.**
 
 ---
 
-*Fin du document (mis à jour le 16 novembre 2026 après l'incident du thème).*
+## 24. Clôture de la phase (16 novembre 2026)
+
+Le développement est **en pause jusqu'aux vacances de décembre 2026**. Le
+téléphone est repassé sous Android pour l'usage quotidien. Tout ce qui suit est
+en état stable, rien ne doit être « fini en urgence ».
+
+### 24.1 État livré
+
+- Branche `herolte-full-advances`, prête pour une Pull Request.
+- L'arbre est propre : aucun fichier modifié non commité, `build/` et `M/` hors
+  suivi Git, aucun secret (le mot de passe Wi-Fi vit dans `drop/`, ignoré).
+- Le thème Liquid Glass est annulé proprement (`86e9dc4`) : `git diff df48eaa^
+  HEAD -- gpu/eagl/src/herosb.c` est vide, le fichier est identique à l'état sain.
+- Les 277 patchs de `xnu/patches/` ont tous un en-tête diff et au moins un hunk ;
+  aucun n'est appliqué hors séquence. Les numéros manquants sont intentionnels :
+  `patches-pending/` porte les expérimentaux A5XELTE jamais validés (`0112`,
+  `0113`, `0115`, `0116`, `0129`–`0134`), et `0106`/`0107` ont été réécrits en
+  `0201`/`0202` pour valoir sur les deux machines.
+- Quatre scripts sont sortis de `build/` (ignoré) vers `tools/` :
+  `herolte-drop-package.sh`, `herolte-drop-recover.sh`, `herolte-diag-readonly.sh`,
+  `herolte-reflash-bt9.sh`.
+
+### 24.2 Ce que la reprise doit savoir
+
+Le téléphone n'est pas cassé : il a seulement gelé sur un thème SpringBoard, et
+le PMIC s'est réarmé après décharge complète. La reprise se fait en trois temps :
+flasher `build/SAFE-xnu-boot-bt9.img` sur `sda5` si nécessaire, écrire un drop
+avec `tools/herolte-drop-package.sh`, redémarrer deux fois. **Ne pas** réécrire
+`glass.off` ni réintroduire de thème.
+
+### 24.3 Ce qui reste ouvert (détail en §19 à §22 et dans HEROLTE-PROGRESS.md)
+
+1. **Bluetooth BCM4359** — matériel entièrement cartographié et piloté
+   (UART1 `0x14C20000`, GPE0-0..3, GPJ1-7, GPI2-3, GPA2-3, firmware
+   `bcm4359C0_semco.hcd` de 59 702 octets chargée). Le handshake HCI (reset +
+   téléchargement du `.hcd`) n'est pas prouvé.
+2. **USB périphérique DWC3** — le bloc répond (`GSNPSID 0x5533280a`) mais
+   `SETEPCONFIG` sur ep0 ne lève jamais `CMDACT`.
+3. **Interruptions** — aucune `IOInterruptEventSource` dans tout le port :
+   tout est en scrutation. C'est le plus gros levier de performance restant.
+4. Modem, caméra, capteurs, Metal.
+
+---
+
+*Fin du document (mis à jour le 16 novembre 2026 : clôture de la phase, thème annulé, branche de Pull Request prête).*
