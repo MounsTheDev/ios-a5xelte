@@ -58,6 +58,14 @@ for ipa in ipa/*.ipa; do
    items+=("app=$ipa")
 done
 
+# GLASS=0 ships an empty glass.off, which turns the Liquid Glass theme off
+# in SpringBoard with no kernel flash (the package still carries everything
+# else, so the next generation installs and the file is simply there).
+if [ "${GLASS:-1}" = 0 ]; then
+   : > build/glass.off
+   items+=(glass.off=build/glass.off)
+fi
+
 missing=0
 for item in "${items[@]}"; do
    src=${item#*=}
