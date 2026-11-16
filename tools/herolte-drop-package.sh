@@ -5,7 +5,7 @@
 # (adb loses a sleeping TWRP). It writes the package to USERDATA and verifies
 # it; it never touches BOOT, EFS or RECOVERY.
 #
-#   bash build/drop-18.sh              (adb must be on PATH)
+#   bash tools/herolte-drop-package.sh              (adb must be on PATH)
 #
 # After it prints "-> verified", reboot TWICE:
 #   1. the first boot installs the package;

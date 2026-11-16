@@ -11,7 +11,7 @@
 # Phone in TWRP, screen awake, cable plugged. Then reboot TWICE (the first
 # boot installs the package, the second loads the library).
 #
-#   bash build/drop-19-recover.sh
+#   bash tools/herolte-drop-recover.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,4 +30,4 @@ echo "libherosb.dylib: gen-17 build confirmed"
 # A second guard, in case a later package ever ships without the revert.
 : > build/glass.off
 
-GEN=19 GLASS=0 bash build/drop-18.sh
+GEN=19 GLASS=0 bash tools/herolte-drop-package.sh
