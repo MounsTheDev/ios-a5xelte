@@ -926,3 +926,93 @@ Discord). **Deux redémarrages** pour l'installer.
 
 *Fin du document. Il est délibérément exhaustif : son but est qu'aucune des
 vingt heures de mesure de cette session ne soit à refaire.*
+
+---
+
+## 23. INCIDENT : le thème Liquid Glass a gelé le téléphone — RÈGLE ABSOLUE
+
+### 23.1 Règle absolue (à ne jamais contourner)
+
+> **Ne plus JAMAIS modifier ni hooker SpringBoard — ni aucune classe privée
+> UIKit/CoreAnimation — depuis un .dylib userspace.** C'est interdit : pas de
+> thèmes visuels, pas de retouches du Dock, de l'App Switcher, du Control
+> Center, de la barre d'état, des coins arrondis, pas de `UIVisualEffectView`.
+> **L'interface native d'iOS 16 reste strictement d'origine.**
+>
+> Raison : SpringBoard est le processus dont l'échec emporte toute l'interface.
+> Le 16 novembre 2026, un thème injecté via `gpu/eagl/src/herosb.c` a fait
+> boucler le téléphone sur `xnu mmu on` puis l'a figé écran noir (PMIC bloqué),
+> nécessitant une décharge complète de la batterie pour réarmer le S2MPS16.
+
+### 23.2 Chronologie exacte de l'incident (16 novembre 2026)
+
+1. `df48eaa` ajoute à `herosb.c` un thème « Liquid Glass » : coins arrondis
+   (Dock 28 pt, cartes 26 pt, panneaux 20 pt), liseré, ombre, et pourcentage
+   de batterie — hooks sur `SBDockView`, `SBAppSwitcherPageView`,
+   `_UIStatusBarBatteryView` (classes privées SpringBoard/UIKit).
+2. Le code compile (vérifié avec clang + stubs, 0 erreur) et passe le build
+   CI `mesa-ios` (run 43898573151).
+3. Drop zone **génération 18** écrite sur USERDATA et **relue depuis le
+   disque** : `HERODRP2`, proto 2, gen 18, 23 entrées, 17 968 680 octets,
+   bloc 6195311, dans la zone drop de 1 Gio (marge restante 257 755 blocs —
+   **aucun débordement**).
+4. Au premier reboot : le téléphone affiche `xnu mmu on` en boucle puis
+   s'éteint sur un écran noir. Les boutons (Vol bas + Home + Power) ne
+   répondent plus : PMIC en boucle watchdog. Décharge batterie obligatoire
+   (~23 h) pour réarmer.
+
+### 23.3 Faits établis (à distinguer des hypothèses)
+
+| Fait | Valeur |
+|---|---|
+| Le noyau BOOT n'a jamais été réécrit cette session | `bt9` = `ff4ec978254765e5…`, intact |
+| La drop 18 n'a pas débordé | marge 257 755 blocs sur 262 144 |
+| Le code a compilé | clang 0 erreur, CI vert |
+| **Mais il a gelé le téléphone** | boucle `xnu mmu on` → écran noir → PMIC |
+| Le code n'a pas été testé sur l'appareil avant le flash | **la seule règle qui compte** |
+
+### 23.4 Cause
+
+Le constructeur de `libherosb.dylib` a ajouté un parcours en profondeur de
+toutes les vues de chaque fenêtre SpringBoard, avec `method_setImplementation`
+sur des classes privées non documentées, exécuté au chargement de la lib dans
+SpringBoard (pid 27). Les messages sont envoyés par `objc_msgSend` casté, sans
+aucune protection contre une classe inattendue ; le bouclage `xnu mmu on` et
+le gel viennent probablement d'un hook sur une classe privée dont l'ABI ne
+correspond pas à la signature supposée. Le constructeur peut aussi tourner
+avant la fin de l'init d'UIKit. **Quelle que soit la cause exacte, le verdict
+est définitif : ne plus hooker SpringBoard.**
+
+### 23.5 Ce qui a été fait après l'incident
+
+- `86e9dc4` : **revert** de `df48eaa` — `herosb.c` est revenu à sa version
+  saine de la génération 17.
+- `M/lib/libherosb.dylib` : restauré au build gen 17 (`bf913b0d923d…`,
+  69 584 o), vérifié par sha256.
+- `build/drop-19-recover.sh` : bundle de récupération prêt — écrit la
+  génération 19 avec le `libherosb` sain + `glass.off` vide (double garde),
+  et **refuse d'écrire** si le sha du binaire n'est pas `bf913b0d…` (testé à
+  blanc : il a refusé le mauvais binaire).
+- `docs/HANDOVER-COMPLET.md` : cette note.
+
+### 23.6 Restauration du téléphone (prête, ~10 min une fois en TWRP)
+
+1. Téléphone en TWRP (après décharge + recharge), câble branché, écran allumé.
+2. Vérifier que BOOT n'a pas bougé :
+   ```
+   adb shell "dd if=/dev/block/sda5 bs=1M count=40 2>/dev/null | sha256sum"
+   # doit commencer par ff4ec978254765e5 (bt9). Sinon reflasher
+   # build/SAFE-xnu-boot-bt9.img depuis TWRP.
+   ```
+3. Écrire la drop de récupération (uniquement USERDATA) :
+   ```
+   bash build/drop-19-recover.sh     # gen 19, libherosb sain + glass.off
+   ```
+4. **Deux redémarrages** : boot 1 installe, boot 2 charge la bibliothèque saine.
+5. Confirmer dans le journal (`herolte-log-pull.py` depuis TWRP) :
+   `HEROLTE DROP: package N ready for userland` (gen 19) et
+   `HEROLTE GL: SpringBoard launch 1 (pid N): libherosb inserted`.
+
+---
+
+*Fin du document (mis à jour le 16 novembre 2026 après l'incident du thème).*
